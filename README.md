@@ -35,6 +35,12 @@ No more "wrong mod version" errors. No more manually sending zip files to friend
 
 ---
 
+## Downloads
+
+**Don't want to install Python?** Grab the pre-built executables from the [Releases](https://github.com/Leo111444/ModSync/releases) page — no installation required, just run and go.
+
+---
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -45,6 +51,28 @@ Install dependencies:
 ```bash
 pip install PyQt6
 ```
+
+---
+
+## Building an Executable
+
+If you want to build a standalone `.exe` yourself:
+
+```bash
+pip install pyinstaller
+```
+
+**Server:**
+```bash
+pyinstaller --onefile --windowed --name ModSync-Server server_app.py
+```
+
+**Client:**
+```bash
+pyinstaller --onefile --windowed --name ModSync-Client client_app.py
+```
+
+The output will be in the `dist/` folder. The `--windowed` flag hides the console window since both apps have a GUI.
 
 ---
 
@@ -156,6 +184,12 @@ ModSync — лёгкое клиент-серверное приложение д
 
 ---
 
+## Скачать
+
+**Не хочешь возиться с Python?** Скачай готовые `.exe` со страницы [Releases](https://github.com/Leo111444/ModSync/releases) — просто запусти и всё.
+
+---
+
 ## Требования
 
 - Python 3.10 и выше
@@ -166,6 +200,28 @@ ModSync — лёгкое клиент-серверное приложение д
 ```bash
 pip install PyQt6
 ```
+
+---
+
+## Сборка в EXE
+
+Если хочешь собрать `.exe` самостоятельно:
+
+```bash
+pip install pyinstaller
+```
+
+**Сервер:**
+```bash
+pyinstaller --onefile --windowed --name ModSync-Server server_app.py
+```
+
+**Клиент:**
+```bash
+pyinstaller --onefile --windowed --name ModSync-Client client_app.py
+```
+
+Готовые файлы появятся в папке `dist/`. Флаг `--windowed` скрывает консоль — у обоих приложений есть GUI.
 
 ---
 
