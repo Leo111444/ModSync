@@ -900,7 +900,8 @@ class ClientEngine:
             "enable_upnp": True,
             "enable_natpmp": True,
             "alert_mask": lt.alert.category_t.error_notification
-                        | lt.alert.category_t.status_notification,
+                        | lt.alert.category_t.status_notification
+                        | lt.alert.category_t.port_mapping_notification,
         })
         self.handle: "lt.torrent_handle | None" = None
         self._lock = threading.Lock()
@@ -1054,8 +1055,11 @@ class ClientEngine:
     def pump_alerts(self) -> list[str]:
         out = []
         for a in self.session.pop_alerts():
-            if a.category() & lt.alert.category_t.error_notification:
-                msg = a.message()
+            cat = a.category()
+            msg = a.message()
+            if cat & lt.alert.category_t.port_mapping_notification:
+                out.append(f"[V2][UPnP] {msg}")
+            elif cat & lt.alert.category_t.error_notification:
                 if "skipping tracker announce" in msg:
                     continue
                 out.append(f"[V2][lt] {msg}")
