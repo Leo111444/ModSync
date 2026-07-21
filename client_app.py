@@ -1,7 +1,12 @@
+import os
+# Bypass system proxy for all urllib requests — ModSync connects directly
+for _pv in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+            "all_proxy", "ALL_PROXY"):
+    os.environ.pop(_pv, None)
+
 import modsync_v2
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -1591,6 +1596,10 @@ class ClientWindow(QWidget):
         # Apply translations (handles initial lang from config)
         self.retranslate_ui()
 
+        # Start seed engine on launch if share was already enabled
+        if bool(self.cfg.get("p2p_share", True)):
+            QTimer.singleShot(3000, self._try_start_seed_engine)
+
     # ---------------- Rules ----------------
 
     def show_rules_dialog(self, force: bool = False) -> bool:
@@ -2029,10 +2038,11 @@ class ClientWindow(QWidget):
     def _fetch_server_list(self):
         """Загружает список серверов с мастер-сервера (вызывается в фоне)."""
         try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             req = urllib.request.Request(
                 MASTER_SERVER_URL + "/ms/servers",
                 headers={"User-Agent": "ModSync-Client/2.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with opener.open(req, timeout=8) as resp:
                 raw = json.loads(resp.read())
             # API может вернуть список напрямую или {"servers": [...]}
             if isinstance(raw, list):
@@ -2073,6 +2083,10 @@ class ClientWindow(QWidget):
             if url:
                 self.cfg["server_url"] = url
                 write_config(self.cfg)
+                # Автозапуск проверки обновлений при первом получении списка серверов
+                if not getattr(self, "_startup_check_done", False):
+                    self._startup_check_done = True
+                    QTimer.singleShot(500, lambda: self.bridge.start_check.emit("auto"))
 
     # ---------------- Status timers ----------------
 
@@ -2124,6 +2138,8 @@ class ClientWindow(QWidget):
             self.append_log("[AUTO] disabled")
 
     def on_autocheck_tick(self):
+        if getattr(self, "v2_updating", False):
+            return
         self.on_save()
         if not self.cfg.get("server_url") or not self.cfg.get("steamid"):
             return
@@ -2794,19 +2810,24 @@ class ClientWindow(QWidget):
         threading.Thread(target=worker, daemon=True).start()
 
     def _send_heartbeat(self):
+        if getattr(self, "v2_updating", False):
+            return
         base = self.cfg.get("server_url", "").strip().rstrip("/")
         steamid = self.cfg.get("steamid", "").strip()
         if not base or not steamid:
             return
         p2p = bool(self.share_btn.isChecked()) if hasattr(self, "share_btn") else False
+        bt_port = self.v2_engine.port if self.v2_engine is not None else 0
         def _post():
             try:
                 import json as _json
-                data = _json.dumps({"steamid": steamid, "p2p": p2p}).encode()
+                data = _json.dumps({"steamid": steamid, "p2p": p2p,
+                                    "bt_port": bt_port}).encode()
                 req = urllib.request.Request(
                     base + "/api/v2/heartbeat",
                     data=data, headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=5)
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                opener.open(req, timeout=5)
             except Exception:
                 pass
         threading.Thread(target=_post, daemon=True).start()

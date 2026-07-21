@@ -888,6 +888,7 @@ class ServerState:
     tracked_mods: set[str] = field(default_factory=set)
     v2: object = None                # modsync_v2.V2State
     publish_trigger: object = None   # колбэк ServerWindow.trigger_publish
+    external_ip: str = ""            # внешний IP сервера (заполняется после старта)
 
     def get_manifest(self) -> dict:
         with self.lock:
@@ -928,6 +929,7 @@ class PublishProgressBridge(QObject):
 # -----------------------------
 
 class ApiHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
     state: ServerState = None
     log: LogBridge = None
 
@@ -1039,9 +1041,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 body = json.loads(self.rfile.read(length)) if length else {}
                 steamid = str(body.get("steamid", "")).strip()
                 p2p = int(bool(body.get("p2p", False)))
+                bt_port = int(body.get("bt_port", 0))
                 ip = self._get_client_ip()
                 if steamid:
                     db_set_client_p2p(steamid, ip, p2p)
+                # Если клиент на LAN и сообщил BT-порт — регистрируем его внешний адрес
+                if (bt_port > 0 and modsync_v2._is_private_ip(ip)
+                        and self.state.external_ip
+                        and self.state.v2 is not None):
+                    self.state.v2.tracker.set_peer_external(
+                        ip, bt_port, self.state.external_ip, bt_port)
                 self._send_json({"ok": True})
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, code=400)
@@ -2615,7 +2624,7 @@ class ServerWindow(QWidget):
                 if port and ip:
                     tracker_url = f"http://{ip}:{port}/announce"
                     tracker_url_local = f"http://{lan_ip}:{port}/announce"
-                    webseed_url = f"http://{ip}:{port}/api/v2/ws/"
+                    webseed_url = ""  # не добавляем web seed — только BitTorrent P2P
                 res = self.state.v2.build.publish(
                     mods_root,
                     server_name=cfg.get("server_name", ""),
@@ -3220,6 +3229,9 @@ class ServerWindow(QWidget):
                 return
             ext_running = f"{ext_ip}:{port}"
             t_port = port + 1
+            self.state.external_ip = ext_ip
+            if self.state.v2 is not None:
+                self.state.v2.external_ip = ext_ip
             self.append_log(self.tr("log_ext_ip", ip=ext_ip))
             self._status_lbl_signal.emit(ext_running)
         except Exception as e:

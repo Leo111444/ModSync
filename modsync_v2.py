@@ -501,10 +501,11 @@ class TorrentEngine:
             "listen_interfaces": f"0.0.0.0:{listen_port}",
             "enable_dht": False,
             "enable_lsd": False,
-            "enable_upnp": False,
-            "enable_natpmp": False,
+            "enable_upnp": True,
+            "enable_natpmp": True,
             "alert_mask": lt.alert.category_t.error_notification
-                        | lt.alert.category_t.status_notification,
+                        | lt.alert.category_t.status_notification
+                        | lt.alert.category_t.port_mapping_notification,
         })
         self.handle: lt.torrent_handle | None = None
         self._lock = threading.Lock()
@@ -552,9 +553,11 @@ class TorrentEngine:
         """Звать периодически (QTimer). Возвращает строки для лога."""
         out = []
         for a in self.session.pop_alerts():
-            if a.category() & lt.alert.category_t.error_notification:
-                msg = a.message()
-                # loopback can't reach LAN tracker — expected noise, not an error
+            cat = a.category()
+            msg = a.message()
+            if cat & lt.alert.category_t.port_mapping_notification:
+                out.append(f"[V2][UPnP-seed] {msg}")
+            elif cat & lt.alert.category_t.error_notification:
                 if "skipping tracker announce" in msg:
                     continue
                 out.append(f"[V2][lt] {msg}")
@@ -575,11 +578,30 @@ class TorrentEngine:
 # Tracker — HTTP announce, in-memory
 # ─────────────────────────────────────────────
 
+def _is_private_ip(ip: str) -> bool:
+    try:
+        p = [int(x) for x in ip.split(".")]
+        return (p[0] == 10 or
+                (p[0] == 172 and 16 <= p[1] <= 31) or
+                (p[0] == 192 and p[1] == 168) or
+                p[0] == 127)
+    except Exception:
+        return False
+
+
 class Tracker:
     def __init__(self):
         self.lock = threading.Lock()
         # {info_hash(20b): {peer_id(20b): (ip_str, port, last_seen, left)}}
         self.swarms: dict[bytes, dict[bytes, tuple]] = {}
+        # (lan_ip, lan_port) → (ext_ip, ext_port) — для подмены LAN адресов внешним
+        self._ext_map: dict[tuple[str, int], tuple[str, int]] = {}
+
+    def set_peer_external(self, lan_ip: str, lan_port: int,
+                          ext_ip: str, ext_port: int) -> None:
+        """Регистрирует внешний адрес для LAN-пира чтобы трекер отдавал его удалённым клиентам."""
+        with self.lock:
+            self._ext_map[(lan_ip, lan_port)] = (ext_ip, ext_port)
 
     def announce(self, info_hash: bytes, peer_id: bytes, ip: str, port: int,
                  left: int, event: str) -> bytes:
@@ -597,9 +619,20 @@ class Tracker:
             peers = [(v[0], v[1]) for pid, v in swarm.items() if pid != peer_id]
             complete = sum(1 for v in swarm.values() if v[3] == 0)
             incomplete = len(swarm) - complete
+            ext_map_snapshot = dict(self._ext_map)
+
+        requester_external = not _is_private_ip(ip)
 
         compact = b""
         for ip_s, p in peers[:50]:
+            if requester_external and _is_private_ip(ip_s):
+                # Внешний клиент не может достучаться до LAN-адреса —
+                # подменяем на известный внешний адрес, иначе пропускаем
+                mapped = ext_map_snapshot.get((ip_s, p))
+                if mapped:
+                    ip_s, p = mapped
+                else:
+                    continue
             try:
                 packed_ip = bytes(int(x) for x in ip_s.split("."))
                 if len(packed_ip) != 4:
@@ -647,6 +680,7 @@ class V2State:
         self.build = BuildManager(data_dir)
         self.tracker = Tracker()
         self.engine: TorrentEngine | None = None  # создаётся на on_start
+        self.external_ip: str = ""
 
     def ensure_engine(self, listen_port: int, log_cb=None) -> TorrentEngine:
         if self.engine is None:
@@ -701,6 +735,9 @@ def handle_v2_get(handler, parsed, v2: V2State, mods_root: Path,
         else:
             ip = handler._get_client_ip()
             body = v2.tracker.announce(info_hash, peer_id, ip, port, left, event)
+            if (v2.external_ip and _is_private_ip(ip)
+                    and port > 0 and event != "stopped"):
+                v2.tracker.set_peer_external(ip, port, v2.external_ip, port)
             swarm = v2.tracker.get_swarm(info_hash)
             if swarm:
                 peer_list = " | ".join(f"{sip}:{sp}({'S' if sl==0 else 'D'})"
@@ -890,7 +927,7 @@ def _serve_file_range(handler, fpath: Path) -> None:
             f.seek(start)
             remaining = length
             while remaining > 0:
-                chunk = f.read(min(1024 * 512, remaining))
+                chunk = f.read(min(PIECE_SIZE, remaining))
                 if not chunk:
                     break
                 handler.wfile.write(chunk)
@@ -915,16 +952,20 @@ class ClientEngine:
     def __init__(self, listen_port: int = 0, log_cb=None):
         self.log_cb = log_cb
         actual_port = listen_port if listen_port else 6893
+        self.port = actual_port
         self.session = lt.session({
             "listen_interfaces": f"0.0.0.0:{actual_port}",
             "enable_dht": False,
             "enable_lsd": True,
             "enable_upnp": True,
             "enable_natpmp": True,
+            "enable_outgoing_utp": True,
+            "enable_incoming_utp": True,
             "alert_mask": lt.alert.category_t.error_notification
                         | lt.alert.category_t.status_notification
                         | lt.alert.category_t.port_mapping_notification
-                        | lt.alert.category_t.tracker_notification,
+                        | lt.alert.category_t.tracker_notification
+                        | lt.alert.category_t.peer_notification,
         })
         self.handle: "lt.torrent_handle | None" = None
         self._lock = threading.Lock()
@@ -983,7 +1024,6 @@ class ClientEngine:
         params.ti = ti
         params.save_path = str(mods_dir.parent)
         params.trackers = [f"{server_url}/announce"]
-        params.url_seeds = [f"{server_url}/api/v2/ws/"]
         params.flags &= ~lt.torrent_flags.paused
         params.flags &= ~lt.torrent_flags.auto_managed
 
@@ -1086,6 +1126,11 @@ class ClientEngine:
                 if "skipping tracker announce" in msg:
                     continue
                 out.append(f"[V2][TR] {msg}")
+            elif cat & lt.alert.category_t.peer_notification:
+                t = type(a).__name__
+                if t in ("peer_connect_alert", "peer_disconnected_alert",
+                         "incoming_connection_alert"):
+                    out.append(f"[V2][PEER] {msg}")
             elif cat & lt.alert.category_t.error_notification:
                 out.append(f"[V2][lt] {msg}")
             elif "external" in msg.lower() and "ip" in msg.lower():
@@ -1300,8 +1345,9 @@ class MasterClient:
 
 def fetch_bytes(url: str, timeout: int = 15) -> bytes:
     import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     req = urllib.request.Request(url, headers={"User-Agent": "ModSync/2.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with opener.open(req, timeout=timeout) as r:
         data = r.read()
         if r.headers.get("Content-Encoding") == "gzip":
             data = gzip.decompress(data)
