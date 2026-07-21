@@ -19,13 +19,19 @@ import urllib.error
 
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer, QFileSystemWatcher
 
+import modsync_v2
+
+APP_VERSION = "2.0.0"
+GITHUB_REPO = "Leo111444/ModSync"
+
 # ─── UPnP ────────────────────────────────────────────────────
 def _get_gateway_ip():
     """Получить IP шлюза через route print."""
     import subprocess, re
     try:
         r = subprocess.run(["route", "print", "0.0.0.0"],
-                           capture_output=True, text=True, timeout=3)
+                           capture_output=True, text=True, timeout=3,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
         for line in r.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 3 and parts[0] == "0.0.0.0":
@@ -323,6 +329,28 @@ def upnp_remove_port(port: int) -> None:
     except Exception:
         pass
 
+
+def upnp_probe() -> tuple[bool, str]:
+    """
+    Быстрая проверка UPnP без открытия порта.
+    Возвращает (ok, external_ip_or_error).
+    """
+    location = _ssdp_find_igd(timeout=3.0)
+    if not location:
+        return False, "Роутер с UPnP не найден. Включите UPnP в настройках роутера."
+    info = _upnp_get_control_url(location)
+    if not info:
+        return False, "Роутер найден, но не удалось прочитать его описание."
+    control_url, service_type = info
+    try:
+        resp = _upnp_soap(control_url, service_type, "GetExternalIPAddress", {})
+        ext_ip = resp.get("NewExternalIPAddress", "")
+        if ext_ip:
+            return True, ext_ip
+        return False, "Роутер найден, но не вернул внешний IP."
+    except Exception as e:
+        return False, f"Роутер найден, ошибка запроса IP: {e}"
+
 from PyQt6.QtGui import QGuiApplication, QFont, QColor, QPalette, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -340,12 +368,7 @@ DEFAULT_PORT = 8765
 
 APPDATA_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "ModSyncServer"
 CONFIG_PATH = APPDATA_DIR / "config.json"
-CACHE_DIR = APPDATA_DIR / "cache"
 DB_PATH = APPDATA_DIR / "server.sqlite"
-
-DEFAULT_CACHE_MAX_GB = 20
-DEFAULT_BUNDLE_TTL_DAYS = 14
-DEFAULT_KEEP_MOD_VERSIONS = 2
 
 
 # -----------------------------
@@ -354,7 +377,6 @@ DEFAULT_KEEP_MOD_VERSIONS = 2
 
 def ensure_appdata_dirs() -> None:
     APPDATA_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def read_config() -> dict:
@@ -396,11 +418,23 @@ def db_init() -> None:
             last_seen INTEGER NOT NULL DEFAULT 0,
             last_ip TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'UNKNOWN',
-            bytes_sent_total INTEGER NOT NULL DEFAULT 0,
-            last_client_manifest_hash TEXT NOT NULL DEFAULT '',
-            last_server_manifest_hash TEXT NOT NULL DEFAULT ''
+            build_id TEXT NOT NULL DEFAULT '',
+            torrent_build_id TEXT NOT NULL DEFAULT ''
         );
         """)
+        # Миграция: старая схема → новая
+        for col in ("build_id TEXT NOT NULL DEFAULT ''",
+                    "torrent_build_id TEXT NOT NULL DEFAULT ''",
+                    "p2p_enabled INTEGER NOT NULL DEFAULT -1"):
+            try:
+                con.execute(f"ALTER TABLE clients ADD COLUMN {col}")
+            except Exception:
+                pass
+        for old_col in ("bytes_sent_total", "last_client_manifest_hash", "last_server_manifest_hash"):
+            try:
+                con.execute(f"ALTER TABLE clients DROP COLUMN {old_col}")
+            except Exception:
+                pass
         con.execute("""
         CREATE TABLE IF NOT EXISTS allowed_steamids (
             steamid TEXT PRIMARY KEY,
@@ -419,43 +453,50 @@ def db_init() -> None:
         con.close()
 
 
-def db_touch_client(
-    steamid: str,
-    ip: str,
-    status: str,
-    last_client_manifest_hash: str,
-    last_server_manifest_hash: str
-) -> None:
+def db_touch_client(steamid: str, ip: str, build_id: str = "", kind: str = "manifest") -> None:
     if not steamid:
         return
+    now = int(time.time())
     con = db_connect()
     try:
-        con.execute("""
-        INSERT INTO clients (steamid, last_seen, last_ip, status, bytes_sent_total, last_client_manifest_hash, last_server_manifest_hash)
-        VALUES (?, ?, ?, ?, 0, ?, ?)
-        ON CONFLICT(steamid) DO UPDATE SET
-            last_seen=excluded.last_seen,
-            last_ip=excluded.last_ip,
-            status=excluded.status,
-            last_client_manifest_hash=excluded.last_client_manifest_hash,
-            last_server_manifest_hash=excluded.last_server_manifest_hash;
-        """, (steamid, int(time.time()), ip, status, last_client_manifest_hash or "", last_server_manifest_hash or ""))
+        if kind == "torrent":
+            con.execute("""
+            INSERT INTO clients (steamid, last_seen, last_ip, status, build_id, torrent_build_id)
+            VALUES (?, ?, ?, '', '', ?)
+            ON CONFLICT(steamid) DO UPDATE SET
+                last_seen=excluded.last_seen,
+                last_ip=excluded.last_ip,
+                torrent_build_id=excluded.torrent_build_id;
+            """, (steamid, now, ip, build_id))
+        else:
+            con.execute("""
+            INSERT INTO clients (steamid, last_seen, last_ip, status, build_id, torrent_build_id)
+            VALUES (?, ?, ?, '', ?, '')
+            ON CONFLICT(steamid) DO UPDATE SET
+                last_seen=excluded.last_seen,
+                last_ip=excluded.last_ip,
+                build_id=excluded.build_id;
+            """, (steamid, now, ip, build_id))
         con.commit()
     finally:
         con.close()
 
 
-def db_add_bytes(steamid: str, add_bytes: int) -> None:
-    if not steamid or add_bytes <= 0:
+
+def db_set_client_p2p(steamid: str, ip: str, p2p_enabled: int) -> None:
+    if not steamid:
         return
+    now = int(time.time())
     con = db_connect()
     try:
         con.execute("""
-        INSERT INTO clients (steamid, last_seen, last_ip, status, bytes_sent_total, last_client_manifest_hash, last_server_manifest_hash)
-        VALUES (?, 0, '', 'UNKNOWN', ?, '', '')
+        INSERT INTO clients (steamid, last_seen, last_ip, status, build_id, torrent_build_id, p2p_enabled)
+        VALUES (?, ?, ?, '', '', '', ?)
         ON CONFLICT(steamid) DO UPDATE SET
-            bytes_sent_total = bytes_sent_total + ?;
-        """, (steamid, int(add_bytes), int(add_bytes)))
+            last_seen=excluded.last_seen,
+            last_ip=excluded.last_ip,
+            p2p_enabled=excluded.p2p_enabled;
+        """, (steamid, now, ip, p2p_enabled))
         con.commit()
     finally:
         con.close()
@@ -465,24 +506,16 @@ def db_list_clients(limit: int = 500) -> list[dict]:
     con = db_connect()
     try:
         cur = con.execute("""
-            SELECT steamid, last_seen, last_ip, status, bytes_sent_total, last_client_manifest_hash, last_server_manifest_hash
+            SELECT steamid, last_seen, last_ip, status, build_id, torrent_build_id,
+                   COALESCE(p2p_enabled, -1)
             FROM clients
             ORDER BY last_seen DESC
             LIMIT ?;
         """, (int(limit),))
         rows = cur.fetchall()
-        out = []
-        for r in rows:
-            out.append({
-                "steamid": r[0],
-                "last_seen": r[1],
-                "last_ip": r[2],
-                "status": r[3],
-                "bytes_sent_total": r[4],
-                "last_client_manifest_hash": r[5],
-                "last_server_manifest_hash": r[6],
-            })
-        return out
+        return [{"steamid": r[0], "last_seen": r[1], "last_ip": r[2],
+                 "status": r[3], "build_id": r[4], "torrent_build_id": r[5],
+                 "p2p_enabled": r[6]} for r in rows]
     finally:
         con.close()
 
@@ -669,15 +702,6 @@ def discover_mod_ids(mods_root: Path) -> list[str]:
     return out
 
 
-def safe_mod_id(mod_id: str) -> bool:
-    if not mod_id or len(mod_id) > 200:
-        return False
-    bad = ["..", "/", "\\", ":", "%"]
-    for b in bad:
-        if b in mod_id:
-            return False
-    return True
-
 # -----------------------------
 # Autoruns defs
 # -----------------------------
@@ -701,44 +725,41 @@ def _build_task_command() -> str:
         return f'"{exe}" "{script}"'
 
 
+_AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
 def task_exists(task_name: str) -> bool:
-    r = subprocess.run(
-        ["schtasks", "/Query", "/TN", task_name],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
-    )
-    return r.returncode == 0
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY) as k:
+            winreg.QueryValueEx(k, task_name)
+            return True
+    except FileNotFoundError:
+        return False
 
 
 def create_autostart_task(task_name: str, command: str) -> tuple[bool, str]:
-    """
-    Создаёт задачу автозапуска при старте системы от имени user.
-    Требуются права администратора.
-    """
-    # /F — перезаписать, если уже есть
-    r = subprocess.run(
-        ["schtasks", "/Create",
-         "/TN", task_name,
-         "/TR", command,
-         "/SC", "ONLOGON",
-         "/RU", "user",
-         "/RL", "HIGHEST",
-         "/IT",
-         "/F"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
-    )
-    if r.returncode == 0:
-        return True, (r.stdout or "").strip()
-    return False, (r.stderr or r.stdout or "schtasks create failed").strip()
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY,
+                            access=winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, task_name, 0, winreg.REG_SZ, command)
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
 
 def delete_autostart_task(task_name: str) -> tuple[bool, str]:
-    r = subprocess.run(
-        ["schtasks", "/Delete", "/TN", task_name, "/F"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace"
-    )
-    if r.returncode == 0:
-        return True, (r.stdout or "").strip()
-    return False, (r.stderr or r.stdout or "schtasks delete failed").strip()
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_KEY,
+                            access=winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, task_name)
+        return True, "ok"
+    except FileNotFoundError:
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
 
 # -----------------------------
 def db_blacklist_add(steamid: str, reason: str = "") -> None:
@@ -785,22 +806,26 @@ def db_blacklist_list() -> list[dict]:
 # Cache utils
 # -----------------------------
 
-def _iter_cache_files() -> list[Path]:
-    ensure_appdata_dirs()
-    if not CACHE_DIR.exists():
-        return []
-    return [p for p in CACHE_DIR.iterdir() if p.is_file()]
-
-
-def cache_stats() -> tuple[int, int]:
-    total = 0
-    files = _iter_cache_files()
-    for p in files:
+def read_server_name_from_config(mods_path: str) -> str | None:
+    """Ищет serverconfig.xml рядом с папкой Mods и возвращает значение ServerName."""
+    import xml.etree.ElementTree as ET
+    candidates = [
+        Path(mods_path).parent / "serverconfig.xml",
+        Path(mods_path).parent.parent / "serverconfig.xml",
+    ]
+    for cfg_path in candidates:
+        if not cfg_path.exists():
+            continue
         try:
-            total += p.stat().st_size
+            root = ET.parse(cfg_path).getroot()
+            for prop in root.iter("property"):
+                if prop.get("name") == "ServerName":
+                    val = (prop.get("value") or "").strip()
+                    if val:
+                        return val
         except Exception:
             pass
-    return total, len(files)
+    return None
 
 
 def human_bytes(n: int) -> str:
@@ -814,94 +839,6 @@ def human_bytes(n: int) -> str:
         return f"{int(x)} {units[i]}"
     return f"{x:.2f} {units[i]}"
 
-
-def purge_cache(log_cb=None) -> None:
-    files = _iter_cache_files()
-    removed = 0
-    freed = 0
-    for p in files:
-        try:
-            sz = p.stat().st_size
-            p.unlink(missing_ok=True)
-            removed += 1
-            freed += sz
-        except Exception:
-            pass
-    if log_cb:
-        log_cb(f"[CACHE] Purge: removed={removed}, freed={human_bytes(freed)}")
-
-
-def enforce_cache_policy(cache_max_gb: int, keep_mod_versions: int, bundle_ttl_days: int, log_cb=None) -> None:
-    ensure_appdata_dirs()
-    now = time.time()
-    max_bytes = int(cache_max_gb) * 1024 * 1024 * 1024
-    ttl_sec = int(bundle_ttl_days) * 24 * 3600
-
-    files = _iter_cache_files()
-
-    mods_group: dict[str, list[Path]] = {}
-    bundles: list[Path] = []
-
-    for p in files:
-        name = p.name
-        if name.startswith("mod_") and name.endswith(".zip"):
-            core = name[4:-4]
-            if len(core) > 66 and core[-65] == "_":
-                mod_id = core[:-65]
-            else:
-                mod_id = core
-            mods_group.setdefault(mod_id, []).append(p)
-        elif name.startswith("bundle_") and name.endswith(".zip"):
-            bundles.append(p)
-
-    removed = 0
-    freed = 0
-
-    # keep N per mod by mtime desc
-    for mod_id, plist in mods_group.items():
-        plist_sorted = sorted(plist, key=lambda x: x.stat().st_mtime, reverse=True)
-        for p in plist_sorted[int(keep_mod_versions):]:
-            try:
-                sz = p.stat().st_size
-                p.unlink(missing_ok=True)
-                removed += 1
-                freed += sz
-            except Exception:
-                pass
-
-    # TTL for bundles
-    for p in bundles:
-        try:
-            age = now - p.stat().st_mtime
-            if ttl_sec > 0 and age > ttl_sec:
-                sz = p.stat().st_size
-                p.unlink(missing_ok=True)
-                removed += 1
-                freed += sz
-        except Exception:
-            pass
-
-    # global cap by oldest mtime
-    files2 = _iter_cache_files()
-    files2_sorted = sorted(files2, key=lambda x: x.stat().st_mtime)
-
-    cur_total = sum(pp.stat().st_size for pp in files2_sorted if pp.exists())
-
-    if max_bytes > 0 and cur_total > max_bytes:
-        for p in files2_sorted:
-            if cur_total <= max_bytes:
-                break
-            try:
-                sz = p.stat().st_size
-                p.unlink(missing_ok=True)
-                removed += 1
-                freed += sz
-                cur_total -= sz
-            except Exception:
-                pass
-
-    if log_cb and (removed > 0 or freed > 0):
-        log_cb(f"[CACHE] Cleanup: removed={removed}, freed={human_bytes(freed)}")
 
 def fetch_allowed_steamids_from_site(auth_url: str, auth_key: str, timeout_sec: int = 6) -> dict:
     """
@@ -940,82 +877,6 @@ def fetch_allowed_steamids_from_site(auth_url: str, auth_key: str, timeout_sec: 
         return {"ok": False, "error": str(e)}
 
 # -----------------------------
-# ZIP / cache
-# -----------------------------
-
-def zip_mod_to_cache(mods_root: Path, mod_id: str, mod_hash: str, log_cb, cache_cfg: dict) -> Path:
-    ensure_appdata_dirs()
-    out_path = CACHE_DIR / f"mod_{mod_id}_{mod_hash}.zip"
-    if out_path.exists():
-        return out_path
-
-    mod_dir = mods_root / mod_id
-    if not mod_dir.exists() or not mod_dir.is_dir():
-        raise FileNotFoundError(f"Mod folder not found: {mod_dir}")
-
-    tmp_path = CACHE_DIR / f".tmp_mod_{mod_id}_{mod_hash}_{int(time.time())}.zip"
-    if log_cb:
-        log_cb(f"[ZIP] Building mod zip: {mod_id}")
-
-    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        for p in mod_dir.rglob("*"):
-            if p.is_file():
-                rel_inside = f"{mod_id}/{p.relative_to(mod_dir).as_posix()}"
-                z.write(p, rel_inside)
-
-    tmp_path.replace(out_path)
-    if log_cb:
-        log_cb(f"[ZIP] Cached: {out_path.name}")
-
-    enforce_cache_policy(
-        cache_max_gb=int(cache_cfg.get("cache_max_gb", DEFAULT_CACHE_MAX_GB)),
-        keep_mod_versions=int(cache_cfg.get("keep_mod_versions", DEFAULT_KEEP_MOD_VERSIONS)),
-        bundle_ttl_days=int(cache_cfg.get("bundle_ttl_days", DEFAULT_BUNDLE_TTL_DAYS)),
-        log_cb=log_cb
-    )
-    return out_path
-
-
-def zip_bundle_to_cache(mods_root: Path, mods: list[dict], log_cb, cache_cfg: dict) -> Path:
-    ensure_appdata_dirs()
-    items = [f"{m['id']}:{m['hash']}" for m in mods]
-    items.sort(key=lambda s: s.lower())
-    key = sha256(("|".join(items)).encode("utf-8")).hexdigest()
-
-    out_path = CACHE_DIR / f"bundle_{key}.zip"
-    if out_path.exists():
-        return out_path
-
-    tmp_path = CACHE_DIR / f".tmp_bundle_{key}_{int(time.time())}.zip"
-    if log_cb:
-        log_cb(f"[ZIP] Building bundle zip ({len(mods)} mods)")
-
-    with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
-        for m in mods:
-            mod_id = m["id"]
-            mod_dir = mods_root / mod_id
-            if not mod_dir.exists() or not mod_dir.is_dir():
-                raise FileNotFoundError(f"Mod folder not found: {mod_dir}")
-
-            for p in mod_dir.rglob("*"):
-                if p.is_file():
-                    rel_inside = f"{mod_id}/{p.relative_to(mod_dir).as_posix()}"
-                    z.write(p, rel_inside)
-
-    tmp_path.replace(out_path)
-    if log_cb:
-        log_cb(f"[ZIP] Cached bundle: {out_path.name}")
-
-    enforce_cache_policy(
-        cache_max_gb=int(cache_cfg.get("cache_max_gb", DEFAULT_CACHE_MAX_GB)),
-        keep_mod_versions=int(cache_cfg.get("keep_mod_versions", DEFAULT_KEEP_MOD_VERSIONS)),
-        bundle_ttl_days=int(cache_cfg.get("bundle_ttl_days", DEFAULT_BUNDLE_TTL_DAYS)),
-        log_cb=log_cb
-    )
-    return out_path
-
-
-# -----------------------------
 # Состояние / Bridges
 # -----------------------------
 
@@ -1025,6 +886,8 @@ class ServerState:
     lock: threading.Lock = field(default_factory=threading.Lock)
     cache_cfg: dict = field(default_factory=dict)
     tracked_mods: set[str] = field(default_factory=set)
+    v2: object = None                # modsync_v2.V2State
+    publish_trigger: object = None   # колбэк ServerWindow.trigger_publish
 
     def get_manifest(self) -> dict:
         with self.lock:
@@ -1053,6 +916,11 @@ class LogBridge(QObject):
 
 class ManifestBridge(QObject):
     manifest_ready = pyqtSignal(dict)
+
+
+class PublishProgressBridge(QObject):
+    progress = pyqtSignal(int, int)   # (piece_idx, num_pieces)
+    done = pyqtSignal()
 
 
 # -----------------------------
@@ -1138,277 +1006,61 @@ class ApiHandler(BaseHTTPRequestHandler):
             return False, f"auth refresh failed: {r.get('error')}"
 
     def log_message(self, fmt, *args):
-        self._log(f"[HTTP] {self.address_string()} - {fmt % args}")
-
-    def _stream_file(self, file_path: Path, download_name: str, steamid: str = "") -> None:
-        st = file_path.stat()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Length", str(st.st_size))
-        self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
-        self.end_headers()
-
-        db_add_bytes(steamid, int(st.st_size))
-
-        with file_path.open("rb") as f:
-            while True:
-                chunk = f.read(8 * 1024 * 1024)  # 8 MB chunks — optimal for large files
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+        msg = fmt % args
+        # /announce шумит каждые 30 мин от каждого пира — отправляем в TRACKER (приглушённый цвет)
+        if "/announce" in self.path:
+            self._log(f"[TRACKER] {self.address_string()} - {msg}")
+        else:
+            self._log(f"[HTTP] {self.address_string()} - {msg}")
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = parsed.path
 
-        if path == "/ping":
-            self._send_json({"ok": True, "ts": int(time.time())})
-            return
-
-        if path == "/manifest":
-            self._send_json(self.state.get_manifest())
-            return
-
-        if path == "/mods":
-            m = self.state.get_manifest()
-            mods = []
-            for mod in m.get("mods", []):
-                mods.append({
-                    "id": mod.get("id"),
-                    "hash": mod.get("hash"),
-                    "size_bytes": mod.get("size_bytes", 0),
-                    "files_count": mod.get("files_count", 0),
-                })
-            self._send_json({"ok": True, "mods": mods, "server_manifest_hash": m.get("manifest_hash")})
-            return
-
-        if path == "/clients":
-            qs = parse_qs(parsed.query)
-            try:
-                limit = int((qs.get("limit", ["500"])[0] or "500"))
-            except Exception:
-                limit = 500
-            items = db_list_clients(limit=limit)
-            self._send_json({"ok": True, "clients": items})
-            return
-
-        if path.startswith("/mod/"):
-            mod_id = path[len("/mod/"):]
-            qs = parse_qs(parsed.query)
-            req_hash = (qs.get("hash", [""])[0] or "").strip()
-            steamid = (qs.get("steamid", [""])[0] or "").strip()
-            ok, reason = self.require_auth(steamid)
-            if not ok:
-                self._send_json({"ok": False, "error": reason}, code=403)
+        if self.state.v2 is not None:
+            if modsync_v2.handle_v2_get(
+                self, parsed, self.state.v2,
+                self.state.get_mods_root(), self.require_auth,
+                touch_client_cb=lambda sid, ip, kind="manifest": db_touch_client(
+                    sid, ip,
+                    (self.state.v2.build.snapshot().get("build_id", "") if self.state.v2 else ""),
+                    kind,
+                ),
+            ):
                 return
-
-            if not safe_mod_id(mod_id):
-                self._send_json({"ok": False, "error": "Bad mod id"}, code=400)
-                return
-
-            mod_map = self.state.get_mod_map()
-            if mod_id not in mod_map:
-                self._send_json({"ok": False, "error": "Mod not found"}, code=404)
-                return
-
-            server_mod = mod_map[mod_id]
-            server_hash = str(server_mod.get("hash", "")).strip()
-
-            if req_hash and req_hash != server_hash:
-                self._send_json({"ok": False, "error": "Hash mismatch", "server_hash": server_hash}, code=409)
-                return
-
-            if server_hash in ("", "ERROR"):
-                self._send_json({"ok": False, "error": "Server mod hash error"}, code=500)
-                return
-
-            mods_root = self.state.get_mods_root()
-            try:
-                zip_path = zip_mod_to_cache(mods_root, mod_id, server_hash, self._log, self.state.cache_cfg)
-            except Exception as e:
-                self._log(f"[MOD] ERROR building zip: {e}")
-                self._send_json({"ok": False, "error": "Failed to build zip"}, code=500)
-                return
-
-            self._log(f"[MOD] Send '{mod_id}' -> {zip_path.name} ({human_bytes(zip_path.stat().st_size)})")
-            self._stream_file(zip_path, f"{mod_id}.zip", steamid=steamid)
-            return
 
         self._send_json({"ok": False, "error": "Not found"}, code=404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        path = parsed.path
 
-        if path == "/heartbeat":
-            data = self._read_json()
-            if not data:
-                self._send_json({"ok": False, "error": "Bad JSON"}, code=400)
-                return
-
-            steamid = str(data.get("steamid", "")).strip()
-            ok, reason = self.require_auth(steamid)
-            if not ok:
-                self._send_json({"ok": False, "error": reason}, code=403)
-                return
-
-            client_manifest_hash = str(data.get("client_manifest_hash", "")).strip()
-
-            server_manifest_hash = str(self.state.get_manifest().get("manifest_hash", "")).strip()
-            status = "OK" if client_manifest_hash and client_manifest_hash == server_manifest_hash else "OUTDATED"
-
-            db_touch_client(
-                steamid=steamid,
-                ip=self._get_client_ip(),
-                status=status,
-                last_client_manifest_hash=client_manifest_hash,
-                last_server_manifest_hash=server_manifest_hash
-            )
-
-            self._log(f"[HEARTBEAT] steamid={steamid or 'N/A'} status={status}")
-            self._send_json({"ok": True, "status": status, "server_manifest_hash": server_manifest_hash})
-            return
-
-        if path == "/diff":
-            data = self._read_json()
-            if not data:
-                self._send_json({"ok": False, "error": "Bad JSON"}, code=400)
-                return
-
-            steamid = str(data.get("steamid", "")).strip()
-            ok, reason = self.require_auth(steamid)
-            if not ok:
-                self._send_json({"ok": False, "error": reason}, code=403)
-                return
-
-            client_mods = data.get("mods", [])
-            client_manifest_hash = str(data.get("client_manifest_hash", "")).strip()
-
-            if not isinstance(client_mods, list):
-                self._send_json({"ok": False, "error": "mods must be a list"}, code=400)
-                return
-
-            client_map = {}
-            for item in client_mods:
-                if not isinstance(item, dict):
-                    continue
-                mid = str(item.get("id", "")).strip()
-                mh = str(item.get("hash", "")).strip()
-                if mid:
-                    client_map[mid] = mh
-
-            server_manifest = self.state.get_manifest()
-            server_hash = server_manifest.get("manifest_hash")
-            server_mods = server_manifest.get("mods", [])
-            server_map = {m.get("id"): m for m in server_mods if isinstance(m, dict) and m.get("id")}
-
-            download = []
-            delete = []
-
-            for mid, smod in server_map.items():
-                sh = str(smod.get("hash", "")).strip()
-                if mid not in client_map or client_map[mid] != sh:
-                    download.append({"id": mid, "hash": sh, "size_bytes": smod.get("size_bytes", 0)})
-
-            for mid in client_map.keys():
-                if mid not in server_map:
-                    delete.append(mid)
-
-            # OK если у клиента нечего скачивать и нечего удалять
-            status = "OK" if (len(download) == 0 and len(delete) == 0) else "OUTDATED"
-            db_touch_client(
-                steamid=steamid,
-                ip=self._get_client_ip(),
-                status=status,
-                last_client_manifest_hash=str(server_hash or ""),  # сохраняем серверный хеш — он теперь "эталон"
-                last_server_manifest_hash=str(server_hash or "")
-            )
-
-            self._log(f"[DIFF] steamid={steamid or 'N/A'} download={len(download)} delete={len(delete)} status={status}")
-            self._send_json({
-                "ok": True,
-                "server_manifest_hash": server_hash,
-                "download": download,
-                "delete": delete,
-            })
-            return
-
-        if path == "/bundle":
-            data = self._read_json()
-            if not data:
-                self._send_json({"ok": False, "error": "Bad JSON"}, code=400)
-                return
-
-            steamid = str(data.get("steamid", "")).strip()
-            ok, reason = self.require_auth(steamid)
-            if not ok:
-                self._send_json({"ok": False, "error": reason}, code=403)
-                return
-
-            server_map = self.state.get_mod_map()
-
-            normalized = []
-
-            if isinstance(data.get("ids"), list):
-                for mid in data["ids"]:
-                    mid = str(mid).strip()
-                    if not mid:
-                        continue
-                    if not safe_mod_id(mid):
-                        self._send_json({"ok": False, "error": f"Bad mod id: {mid}"}, code=400)
-                        return
-                    if mid not in server_map:
-                        self._send_json({"ok": False, "error": f"Mod not found: {mid}"}, code=404)
-                        return
-                    sh = str(server_map[mid].get("hash", "")).strip()
-                    if sh in ("", "ERROR"):
-                        self._send_json({"ok": False, "error": f"Server hash error for {mid}"}, code=500)
-                        return
-                    normalized.append({"id": mid, "hash": sh})
-
-            elif isinstance(data.get("mods"), list):
-                for item in data["mods"]:
-                    if not isinstance(item, dict):
-                        continue
-                    mid = str(item.get("id", "")).strip()
-                    mh = str(item.get("hash", "")).strip()
-                    if not mid:
-                        continue
-                    if not safe_mod_id(mid):
-                        self._send_json({"ok": False, "error": f"Bad mod id: {mid}"}, code=400)
-                        return
-                    if mid not in server_map:
-                        self._send_json({"ok": False, "error": f"Mod not found: {mid}"}, code=404)
-                        return
-                    sh = str(server_map[mid].get("hash", "")).strip()
-                    if sh in ("", "ERROR"):
-                        self._send_json({"ok": False, "error": f"Server hash error for {mid}"}, code=500)
-                        return
-                    if mh and mh != sh:
-                        self._send_json({"ok": False, "error": f"Hash mismatch for {mid}", "server_hash": sh}, code=409)
-                        return
-                    normalized.append({"id": mid, "hash": sh})
-            else:
-                self._send_json({"ok": False, "error": "Provide ids:[..] or mods:[{id,hash?}]"}, code=400)
-                return
-
-            if not normalized:
-                self._send_json({"ok": False, "error": "No valid mods in request"}, code=400)
-                return
-
-            mods_root = self.state.get_mods_root()
+        if parsed.path == "/api/v2/heartbeat":
             try:
-                zip_path = zip_bundle_to_cache(mods_root, normalized, self._log, self.state.cache_cfg)
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length else {}
+                steamid = str(body.get("steamid", "")).strip()
+                p2p = int(bool(body.get("p2p", False)))
+                ip = self._get_client_ip()
+                if steamid:
+                    db_set_client_p2p(steamid, ip, p2p)
+                self._send_json({"ok": True})
             except Exception as e:
-                self._log(f"[BUNDLE] ERROR building bundle: {e}")
-                self._send_json({"ok": False, "error": "Failed to build bundle"}, code=500)
-                return
-
-            self._log(f"[BUNDLE] Send bundle -> {zip_path.name} ({human_bytes(zip_path.stat().st_size)})")
-            self._stream_file(zip_path, "mods.zip", steamid=steamid)
+                self._send_json({"ok": False, "error": str(e)}, code=400)
             return
+
+        if self.state.v2 is not None and self.state.publish_trigger is not None:
+            if modsync_v2.handle_v2_post(self, parsed, self.state.v2,
+                                          self.state.publish_trigger):
+                return
 
         self._send_json({"ok": False, "error": "Not found"}, code=404)
+
+
+class QuietHTTPServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class HttpServerThread(threading.Thread):
@@ -1418,11 +1070,11 @@ class HttpServerThread(threading.Thread):
         self.port = port
         self.state = state
         self.log = log
-        self.httpd: ThreadingHTTPServer | None = None
+        self.httpd: QuietHTTPServer | None = None
 
     def run(self):
         try:
-            self.httpd = ThreadingHTTPServer((self.host, self.port), ApiHandler)
+            self.httpd = QuietHTTPServer((self.host, self.port), ApiHandler)
             # Disable Nagle's algorithm — send data immediately without buffering
             self.httpd.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             # Increase send buffer to 8 MB for fast file transfers
@@ -1443,291 +1095,333 @@ class HttpServerThread(threading.Thread):
 
 
 # -----------------------------
-# Bridges
-# -----------------------------
-
-class ManifestBridge(QObject):
-    manifest_ready = pyqtSignal(dict)
-
-
-# -----------------------------
 # GUI
 # -----------------------------
 
-DARK_STYLE = """
+GLASS_STYLE = """
 QWidget {
-    background-color: #1a1d2e;
-    color: #c9d1d9;
-    font-family: 'Segoe UI', Arial, sans-serif;
+    background-color: #0e1016;
+    color: #dde3f0;
+    font-family: 'Segoe UI', 'SF Pro Display', Arial, sans-serif;
     font-size: 13px;
 }
-QGroupBox {
-    background-color: #212436;
-    border: 1px solid #30364a;
-    border-radius: 8px;
-    margin-top: 18px;
-    padding: 10px 10px 6px 10px;
-    font-weight: bold;
-    color: #8b9ebe;
+/* ── Cards ── */
+QFrame#glass_card {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px;
 }
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 12px;
-    top: 0px;
-    padding: 2px 6px;
-    color: #7aa2f7;
-    font-size: 11px;
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    background-color: #212436;
-}
+/* ── Inputs ── */
 QLineEdit {
-    background-color: #0d1117;
-    border: 1px solid #30364a;
-    border-radius: 5px;
-    padding: 5px 8px;
-    color: #c9d1d9;
-    selection-background-color: #3d59a1;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 8px;
+    padding: 6px 10px;
+    color: #dde3f0;
+    selection-background-color: rgba(99,102,241,0.40);
 }
 QLineEdit:focus {
-    border: 1px solid #7aa2f7;
+    border-color: rgba(99,102,241,0.65);
+    background: rgba(99,102,241,0.06);
 }
+QLineEdit:disabled {
+    color: rgba(255,255,255,0.25);
+    border-color: rgba(255,255,255,0.04);
+}
+/* ── Buttons base ── */
 QPushButton {
-    background-color: #2a2f45;
-    border: 1px solid #3d4663;
-    border-radius: 6px;
-    padding: 5px 16px;
-    color: #c9d1d9;
-    font-weight: 500;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 8px;
+    padding: 5px 14px;
+    color: #dde3f0;
     min-height: 28px;
-    min-width: 40px;
+    min-width: 32px;
+    font-weight: 500;
 }
 QPushButton:hover {
-    background-color: #313857;
-    border-color: #7aa2f7;
+    background: rgba(255,255,255,0.11);
+    border-color: rgba(99,102,241,0.50);
     color: #ffffff;
 }
 QPushButton:pressed {
-    background-color: #1a1f36;
+    background: rgba(255,255,255,0.03);
 }
-QPushButton:focus {
-    outline: none;
-    border-color: #5a7abf;
-}
+QPushButton:focus { outline: none; }
 QPushButton:disabled {
-    background-color: #1e2235;
-    border-color: #252a40;
-    color: #4a5270;
+    background: rgba(255,255,255,0.02);
+    border-color: rgba(255,255,255,0.04);
+    color: rgba(255,255,255,0.18);
 }
+/* ── Start / Stop ── */
 QPushButton#start_btn {
-    background-color: #1a3a2a;
-    border-color: #2ea04b;
-    color: #3fb950;
-    font-weight: bold;
+    background: rgba(34,197,94,0.12);
+    border-color: rgba(34,197,94,0.40);
+    color: #4ade80;
+    font-weight: 700;
+    min-width: 90px;
 }
 QPushButton#start_btn:hover {
-    background-color: #1f4a32;
-    border-color: #3fb950;
-    color: #4dca60;
+    background: rgba(34,197,94,0.20);
+    border-color: #4ade80;
+}
+QPushButton#start_btn:disabled {
+    background: rgba(34,197,94,0.03);
+    border-color: rgba(34,197,94,0.08);
+    color: rgba(74,222,128,0.18);
 }
 QPushButton#stop_btn {
-    background-color: #3a1a1a;
-    border-color: #a02e2e;
-    color: #f85149;
-    font-weight: bold;
+    background: rgba(239,68,68,0.12);
+    border-color: rgba(239,68,68,0.40);
+    color: #f87171;
+    font-weight: 700;
+    min-width: 90px;
 }
 QPushButton#stop_btn:hover {
-    background-color: #4a2020;
-    border-color: #f85149;
+    background: rgba(239,68,68,0.20);
+    border-color: #f87171;
 }
+QPushButton#stop_btn:disabled {
+    background: rgba(239,68,68,0.03);
+    border-color: rgba(239,68,68,0.08);
+    color: rgba(248,113,113,0.18);
+}
+/* ── Accent (publish) ── */
+QPushButton#accent_btn {
+    background: rgba(99,102,241,0.15);
+    border-color: rgba(99,102,241,0.45);
+    color: #a5b4fc;
+    font-weight: 600;
+}
+QPushButton#accent_btn:hover {
+    background: rgba(99,102,241,0.25);
+    border-color: #a5b4fc;
+}
+QPushButton#accent_btn:disabled {
+    background: rgba(99,102,241,0.04);
+    border-color: rgba(99,102,241,0.10);
+    color: rgba(165,180,252,0.20);
+}
+/* ── Scan / utility blue ── */
 QPushButton#scan_btn {
-    background-color: #1a2a3a;
-    border-color: #2e6aa0;
-    color: #58a6ff;
+    background: rgba(56,189,248,0.10);
+    border-color: rgba(56,189,248,0.30);
+    color: #7dd3fc;
 }
 QPushButton#scan_btn:hover {
-    background-color: #1f3550;
-    border-color: #58a6ff;
+    background: rgba(56,189,248,0.18);
+    border-color: #7dd3fc;
 }
-QPushButton#purge_btn {
-    background-color: #2a1a0a;
-    border-color: #a05e2e;
-    color: #e3814c;
-}
-QPushButton#purge_btn:hover {
-    border-color: #e3814c;
-}
+/* ── Mode buttons (Open / Whitelist) ── */
 QPushButton#mode_btn {
-    background-color: #1e2235;
-    border: 1px solid #3d4663;
-    border-radius: 6px;
-    padding: 5px 14px;
-    color: #6a7494;
+    background: rgba(255,255,255,0.04);
+    border-color: rgba(255,255,255,0.08);
+    color: #5a6070;
     font-weight: 500;
-    min-height: 26px;
+    min-width: 100px;
 }
 QPushButton#mode_btn:hover {
-    border-color: #7aa2f7;
-    color: #c9d1d9;
+    border-color: rgba(99,102,241,0.40);
+    color: #dde3f0;
 }
 QPushButton#mode_btn:checked {
-    background-color: #1a2d4a;
-    border: 2px solid #7aa2f7;
-    color: #89b4fa;
-    font-weight: bold;
+    background: rgba(99,102,241,0.18);
+    border: 1.5px solid rgba(99,102,241,0.65);
+    color: #a5b4fc;
+    font-weight: 600;
 }
-QPushButton#spin_btn {
-    background-color: #1e2235;
-    border: 1px solid #3d4663;
-    border-radius: 4px;
-    padding: 0px 4px;
-    color: #7aa2f7;
+/* ── Helper buttons (?) ── */
+QPushButton#help_btn {
+    background: rgba(56,189,248,0.10);
+    border: 1px solid rgba(56,189,248,0.30);
+    border-radius: 11px;
+    color: #7dd3fc;
+    font-weight: 700;
+    font-size: 12px;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0;
+}
+QPushButton#help_btn:hover {
+    background: rgba(56,189,248,0.22);
+    border-color: #7dd3fc;
+}
+/* ── Update notification ── */
+QPushButton#update_btn {
+    background: rgba(251,191,36,0.12);
+    border-color: rgba(251,191,36,0.35);
+    color: #fbbf24;
+    font-weight: 600;
     font-size: 11px;
-    min-width: 20px;
-    min-height: 20px;
-    max-width: 20px;
-    max-height: 20px;
-    font-weight: normal;
+    padding: 3px 10px;
+    min-height: 22px;
 }
-QPushButton#spin_btn:hover {
-    background-color: #2a3050;
-    border-color: #7aa2f7;
-    color: #ffffff;
+QPushButton#update_btn:hover {
+    background: rgba(251,191,36,0.22);
+    border-color: #fbbf24;
 }
-QPushButton#spin_btn:pressed {
-    background-color: #1a1f36;
-}
-QPushButton#spin_btn:focus {
-    outline: none;
-    border-color: #3d4663;
-}
+/* ── Progress bar ── */
 QProgressBar {
-    background-color: #0d1117;
-    border: 1px solid #30364a;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: 5px;
     text-align: center;
-    color: #c9d1d9;
     font-size: 11px;
-    max-height: 16px;
+    max-height: 8px;
 }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 #3d5999, stop:1 #7aa2f7);
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+        stop:0 #6366f1, stop:1 #a5b4fc);
     border-radius: 4px;
 }
-QProgressBar#cache_bar[warningLevel="warn"]::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 #a07020, stop:1 #f0a020);
-}
-QProgressBar#cache_bar[warningLevel="crit"]::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-        stop:0 #a02020, stop:1 #f05050);
-}
+/* ── Text/Log ── */
 QTextEdit {
-    background-color: #0d1117;
-    border: 1px solid #21262d;
-    border-radius: 6px;
-    color: #8b9ebe;
-    font-family: 'Consolas', 'Courier New', monospace;
+    background: rgba(0,0,0,0.30);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+    color: #8898b8;
+    font-family: 'Consolas','Cascadia Mono',monospace;
     font-size: 12px;
-    padding: 4px;
+    padding: 6px;
 }
+/* ── Tables ── */
 QTableWidget {
-    background-color: #0d1117;
-    border: 1px solid #21262d;
-    border-radius: 6px;
-    gridline-color: #21262d;
-    color: #c9d1d9;
-    selection-background-color: #1f2d4a;
-    alternate-background-color: #111520;
+    background: rgba(0,0,0,0.20);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+    gridline-color: rgba(255,255,255,0.04);
+    color: #dde3f0;
+    selection-background-color: rgba(99,102,241,0.22);
+    alternate-background-color: rgba(255,255,255,0.02);
 }
 QTableWidget::item:selected {
-    background-color: #1f2d4a;
+    background: rgba(99,102,241,0.28);
     color: #ffffff;
 }
-QTableWidget::item:focus {
-    outline: none;
-    border: none;
-}
+QTableWidget::item:focus { outline: none; border: none; }
 QTableCornerButton::section {
-    background-color: #0d1117;
-    border: 1px solid #21262d;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.06);
 }
-
 QHeaderView::section {
-    background-color: #161b27;
-    color: #8b9ebe;
+    background: rgba(255,255,255,0.04);
+    color: #5a6070;
     border: none;
-    border-bottom: 1px solid #30364a;
-    padding: 6px 8px;
-    font-weight: bold;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    padding: 7px 10px;
+    font-weight: 600;
     font-size: 11px;
     letter-spacing: 0.5px;
 }
-QHeaderView::section:first {
-    border-radius: 6px 0 0 0;
-}
+/* ── Tabs ── */
 QTabWidget::pane {
-    border: 1px solid #30364a;
-    border-radius: 6px;
-    background-color: #1a1d2e;
-}
-QTabBar::tab {
-    background-color: #161b27;
-    border: 1px solid #21262d;
-    border-bottom: none;
-    border-radius: 5px 5px 0 0;
-    padding: 6px 18px;
-    color: #8b9ebe;
-    margin-right: 2px;
-}
-QTabBar::tab:selected {
-    background-color: #1a1d2e;
-    color: #7aa2f7;
-    border-color: #30364a;
-}
-QTabBar::tab:hover:!selected {
-    background-color: #1e2335;
-    color: #c9d1d9;
-}
-QSplitter::handle {
-    background-color: #30364a;
-    width: 2px;
-}
-QScrollBar:vertical {
-    background: #0d1117;
-    width: 8px;
-    border-radius: 4px;
-}
-QScrollBar::handle:vertical {
-    background: #30364a;
-    border-radius: 4px;
-    min-height: 20px;
-}
-QScrollBar::handle:vertical:hover {
-    background: #4a5270;
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0;
-}
-QLabel {
+    border: none;
     background: transparent;
 }
-
-QCheckBox::indicator {
-    width: 18px;
-    height: 18px;
-    border-radius: 4px;
-    border: 1px solid #3d4663;
-    background: #0d1117;
+QTabWidget > QStackedWidget {
+    background: transparent;
 }
-QCheckBox::indicator:checked {
-    background: #1a3a6a;
-    border: 2px solid #7aa2f7;
-    image: none;
+QTabWidget > QStackedWidget > QWidget {
+    background: transparent;
+}
+QTabBar {
+    background: transparent;
+}
+QTabBar::tab {
+    background: transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 7px 18px;
+    color: #5a6070;
+    margin: 4px 2px 0 2px;
+    font-weight: 500;
+}
+QTabBar::tab:selected {
+    background: rgba(99,102,241,0.15);
+    color: #a5b4fc;
+    font-weight: 600;
+}
+QTabBar::tab:hover:!selected {
+    background: rgba(255,255,255,0.05);
+    color: #dde3f0;
+}
+/* ── Scrollbars ── */
+QScrollBar:vertical {
+    background: transparent;
+    width: 6px;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical {
+    background: rgba(255,255,255,0.15);
+    border-radius: 3px;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.25); }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal {
+    background: transparent;
+    height: 6px;
+    border-radius: 3px;
+}
+QScrollBar::handle:horizontal {
+    background: rgba(255,255,255,0.15);
+    border-radius: 3px;
+    min-width: 20px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+/* ── Tooltips ── */
+QToolTip {
+    background: #1a1d2a;
+    border: 1px solid rgba(99,102,241,0.40);
+    border-radius: 8px;
+    color: #dde3f0;
+    padding: 7px 11px;
+    font-size: 12px;
+    opacity: 240;
+}
+/* ── Labels ── */
+QLabel { background: transparent; }
+QLabel#section_label {
+    color: #6366f1;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(99,102,241,0.20);
+    margin-bottom: 4px;
+}
+QLabel#status_ok   { color: #4ade80; font-weight: 600; }
+QLabel#status_stop { color: #f87171; font-weight: 600; }
+/* ── Status bar ── */
+QFrame#statusbar {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    min-height: 32px;
+    max-height: 32px;
+    margin: 0 0 8px 0;
+}
+/* ── Status bar small buttons ── */
+QPushButton#sb_btn {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 6px;
+    padding: 2px 10px;
+    color: #6c7086;
+    min-height: 22px;
+    max-height: 22px;
+    font-size: 11px;
+    font-weight: 500;
+}
+QPushButton#sb_btn:hover {
+    background: rgba(255,255,255,0.10);
+    border-color: rgba(99,102,241,0.40);
+    color: #dde3f0;
 }
 """
+DARK_STYLE = GLASS_STYLE  # backward compat alias
 
 
 
@@ -1754,13 +1448,99 @@ class StatusLight(QLabel):
         self.setToolTip(state.capitalize())
 
 
+class ToggleSwitch(QWidget):
+    """iOS-style toggle switch emitting toggled(bool)."""
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, parent=None, checked: bool = False):
+        super().__init__(parent)
+        self._checked = checked
+        self._anim = 1.0 if checked else 0.0
+        self.setFixedSize(46, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._timer = QTimer(self)
+        self._timer.setInterval(14)
+        self._timer.timeout.connect(self._step)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, val: bool, emit: bool = True):
+        if self._checked == val:
+            return
+        self._checked = val
+        self._timer.start()
+        if emit:
+            self.toggled.emit(val)
+
+    def blockSignals(self, block: bool) -> bool:
+        return super().blockSignals(block)
+
+    def _step(self):
+        target = 1.0 if self._checked else 0.0
+        diff = target - self._anim
+        if abs(diff) < 0.08:
+            self._anim = target
+            self._timer.stop()
+        else:
+            self._anim += diff * 0.35
+        self.update()
+
+    def mousePressEvent(self, event):
+        self.setChecked(not self._checked)
+
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainter, QColor
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = self._anim
+        w, h = self.width(), self.height()
+        # track: off=#2c3044 → on=#22c55e
+        r = int(0x2c + (0x22 - 0x2c) * t)
+        g = int(0x30 + (0xc5 - 0x30) * t)
+        b = int(0x44 + (0x5e - 0x44) * t)
+        p.setBrush(QColor(r, g, b))
+        p.setPen(Qt.PenStyle.NoPen)
+        track_h = h - 4
+        p.drawRoundedRect(0, 2, w, track_h, track_h // 2, track_h // 2)
+        # knob: diameter fits track with 2px margin top/bottom
+        knob_d = track_h - 4
+        knob_y = (h - knob_d) // 2
+        knob_x = int(2 + t * (w - 4 - knob_d))
+        p.setBrush(QColor(255, 255, 255))
+        p.drawEllipse(knob_x, knob_y, knob_d, knob_d)
+        p.end()
+
+
+def _make_card(title: str = "") -> tuple["QFrame", "QVBoxLayout", "QLabel | None"]:
+    """Returns (card_frame, inner_layout, title_label_or_None)."""
+    from PyQt6.QtWidgets import QFrame, QVBoxLayout, QLabel
+    card = QFrame()
+    card.setObjectName("glass_card")
+    outer = QVBoxLayout(card)
+    outer.setContentsMargins(16, 14, 16, 14)
+    outer.setSpacing(0)
+    title_lbl = None
+    if title:
+        title_lbl = QLabel(title.upper())
+        title_lbl.setObjectName("section_label")
+        title_lbl.setFixedHeight(26)
+        outer.addWidget(title_lbl)
+    inner = QVBoxLayout()
+    inner.setSpacing(8)
+    inner.setContentsMargins(0, 6, 0, 0)
+    outer.addLayout(inner)
+    outer.addStretch(1)
+    return card, inner, title_lbl
+
 
 # ─── LOCALISATION (EN / RU) ──────────────────────────────────
 TRANSLATIONS = {
     "en": {
         "window_title":         "ModSync Server",
         # Groups
-        "grp_server":           "Server",
+        "grp_server":           "Server Settings",
+        "grp_build":            "Build & Publish",
         "grp_cache":            "Cache Policy",
         "grp_access":           "Access Control",
         # Labels
@@ -1783,48 +1563,76 @@ TRANSLATIONS = {
         "lbl_mods_summary":     "Detected: {total}  ·  Selected: {sel}  ·  {size}",
         "lbl_blacklist":        "Blacklist — Blocked SteamIDs",
         # Buttons
-        "btn_select":           "📁  Select",
+        "btn_select":           "Select",
         "btn_select_tip":       "Select mods folder",
         "btn_auto_port":        "Auto",
-        "btn_start":            "▶  Start",
-        "btn_stop":             "■  Stop",
+        "btn_start":            "Start",
+        "btn_stop":             "Stop",
         "btn_autostart_on":     "Autostart: ON",
         "btn_autostart_off":    "Autostart: OFF",
-        "btn_upnp_off":         "🌐  UPnP: OFF",
-        "btn_upnp_on":          "🌐  UPnP: ON",
-        "btn_upnp_failed":      "🌐  UPnP: FAILED",
+        "btn_upnp_off":         "UPnP: OFF",
+        "btn_upnp_on":          "UPnP: ON",
+        "btn_upnp_failed":      "UPnP: ERR",
         "btn_upnp_tip":         "Auto port-forward via UPnP.\nRequires UPnP-enabled router.",
         "btn_upnp_fail_tip":    "Could not open port {port} automatically.\nForward it manually in router settings:\n  Protocol: TCP\n  External port: {port}\n  Internal IP: {ip}\n  Internal port: {port}",
         "btn_upnp_ok_tip":      "UPnP active — external {ip}:{port}",
-        "btn_apply_cache":      "✔  Apply",
-        "btn_scan":             "⟳  Scan",
-        "btn_purge":            "🗑  Purge",
-        "btn_open_cache":       "📂  Open Cache",
-        "btn_open_cache_tip":   "Open cache folder in Explorer",
-        "btn_mode_open":        "🌐  Open",
-        "btn_mode_wl":          "🛡  Whitelist",
-        "btn_instr":            "📖  How to setup Whitelist",
-        "btn_sync_auth":        "⟳  Sync SteamIDs",
-        "btn_copy_steamid":     "📋  Copy SteamID",
-        "btn_ban":              "🚫  Ban",
+        "btn_apply_cache":      "Apply",
+        "btn_scan":             "Refresh",
+        "btn_scan_tip":         "Rescan the Mods folder and update the file list.\nHappens automatically on file change.",
+        "btn_publish":          "Publish",
+        "btn_publish_tip":      "Publish the current Mods snapshot as a new build for clients to download.",
+        "btn_auto_publish":     "Auto-publish",
+        "tip_auto_publish":     "ON: changes in Mods folder are published automatically (5 sec delay).\nOFF: manual publish only.",
+        "lbl_build":            "Build:",
+        "lbl_listing":          "Public listing",
+        "tip_listing":          "Register this server on the master server (bar7dtd.ru) so clients can find it automatically.\nIn Whitelist mode the server is visible but mod exchange works only with your authorised players.",
+        "lbl_auto_publish":     "Auto-publish",
+        "lbl_server_name":      "Listing name:",
+        "tip_server_name":      "Name shown in the public server list. Leave empty to use serverconfig.xml.",
+        "lbl_port":             "Port:",
+        "tip_port":             "HTTP port the server listens on. Players connect to this port.",
+        "lbl_auto_port":        "Auto",
+        "lbl_auto_port_colon":  "Auto:",
+        "tip_auto_port":        "ON: pick a random free port automatically.\nOFF: use the port entered above.",
+        "lbl_seed_stats":       "peers: {peers} · sent: {mb:.1f} MB · {kb:.0f} KB/s",
+        "lbl_log_title":        "Server Log",
+        "btn_clear_log":        "Clear",
+        "log_auto_pub_on":      "[APP] Auto-publish enabled",
+        "log_auto_pub_off":     "[APP] Auto-publish disabled",
+        "btn_mode_open":        "Open",
+        "tip_mode_open":        "Anyone with a Steam account can download mods.",
+        "btn_mode_wl":          "Whitelist",
+        "tip_mode_wl":          "Only SteamIDs on your whitelist can download mods.",
+        "btn_instr":            "Whitelist setup guide",
+        "btn_sync_auth":        "Sync SteamIDs",
+        "tip_sync_auth":        "Fetch the whitelist from Auth URL right now.",
+        "btn_copy_steamid":     "Copy SteamID",
+        "btn_ban":              "Ban",
         "btn_ban_tip":          "Add selected SteamID to blacklist",
-        "btn_unban":            "✅  Unban",
-        "btn_copy_allowed":     "📋  Copy SteamID",
+        "btn_unban":            "Unban",
+        "btn_copy_allowed":     "Copy SteamID",
         "btn_mods_all":         "All",
         "btn_mods_none":        "None",
-        "btn_mods_apply":       "✔  Apply",
-        "btn_lang":             "🌐 RU",
+        "btn_mods_apply":       "Apply",
+        "btn_lang":             "RU",
+        "btn_tooltips_on":      "Hints: ON",
+        "btn_tooltips_off":     "Hints: OFF",
+        "tip_tooltips":         "Show/hide button tooltips.",
+        "lbl_update":           "Update {v} available",
+        "btn_download_update":  "↗ Download",
         # Tabs
         "tab_clients":          "Clients",
         "tab_whitelist":        "Whitelist",
         "tab_mods":             "Mods",
         "tab_blacklist":        "Blacklist",
+        "tab_logs":             "Logs",
         # Table headers
         "th_steamid":           "SteamID",
         "th_last_seen":         "Last Seen",
         "th_ip":                "IP",
         "th_status":            "Status",
-        "th_sent":              "Sent",
+        "th_build":             "Build",
+        "th_p2p":               "P2P",
         "th_mod_name":          "Mod Name",
         "th_files":             "Files",
         "th_size":              "Size",
@@ -1843,15 +1651,74 @@ TRANSLATIONS = {
         "upnp_removed":         "[UPnP] Port mapping removed.",
         "upnp_enabled_log":     "[UPnP] Enabled — port will be forwarded on next server start.",
         "upnp_disabled_log":    "[UPnP] Disabled.",
-        "upnp_restore_tip":     "Автоматически пробросить порт через UPnP.\nТребует роутер с включённым UPnP.",
+        "upnp_restore_tip":     "Auto port-forward via UPnP.\nRequires UPnP-enabled router.",
+        # Tooltips (not in retranslate yet)
+        "tip_mods_path":        "Path to the game server Mods folder.",
+        "tip_serverconfig":     "Select serverconfig.xml to read the server name automatically.",
+        "tip_start":            "Start the HTTP server and begin serving mods.",
+        "tip_stop":             "Stop the server.",
+        "tip_autostart":        "Automatically start the server when Windows boots.",
+        "tip_ms_help":          "What is the master server?",
+        "tip_copy_steamid":     "Copy the selected player's SteamID to clipboard.",
+        "tip_copy_allowed":     "Copy the selected SteamID from whitelist.",
+        "tip_bl_add":           "Add SteamID to blacklist.",
+        "tip_bl_remove":        "Remove selected SteamID from blacklist.",
+        "tip_instr":            "Open the whitelist setup guide.",
+        # Master server dialog
+        "dlg_ms_help_title":    "ModSync Master Server",
+        "dlg_ms_help_text": (
+            "<b>What is the master server?</b><br><br>"
+            "The master server is a central registry of ModSync servers at bar7dtd.ru.<br><br>"
+            "<b>What public listing gives you:</b><br>"
+            "• ModSync clients can find your server automatically — no manual address entry needed.<br>"
+            "• Your server participates in cross-seeding: clients from other servers "
+            "can download shared mod files from your players, reducing your bandwidth load.<br><br>"
+            "<b>What is sent to the master server:</b><br>"
+            "• Server name, IP address and ModSync port.<br>"
+            "• build_id and a list of file root-hashes (no file contents).<br>"
+            "• Heartbeat every 5 minutes (online/offline status).<br><br>"
+            "<b>Privacy:</b> if listing is disabled — no data is transmitted "
+            "and your server is not visible in the list."
+        ),
+        # Build status
+        "v2_publishing":        "publishing…",
+        "v2_not_published":     "not published",
+        "v2_has_changes":       "{build_id} · pending changes",
+        "v2_published":         "{build_id} · {fc} files · published",
+        # Restart watch
+        "lbl_wl_hint_listing":  "ℹ Whitelist mode: visible in the list, but mods shared only with authorised players",
+        "lbl_restart_watch":    "Track server restart",
+        "tip_restart_watch":    (
+            "Watch 7DaysToDieServer.exe PID every 30 sec.\n"
+            "When PID changes (server restarted) — republish the build after 10 sec\n"
+            "so players always get up-to-date mods before joining."
+        ),
+        "log_rw_on":            "[APP] Server restart tracking enabled",
+        "log_rw_off":           "[APP] Server restart tracking disabled",
+        "log_rw_restarted":     "[APP] Server restarted (new PID: {pid}) — republishing in 10 sec…",
+        "log_rw_republish":     "[APP] Auto-republish triggered after server restart",
+        "dlg_close_title":      "Stop server?",
+        "dlg_close_text":       "The HTTP server is currently running. Clients will not be able to sync.\n\nStop the server and close the application?",
+        "lbl_status_tip_ports": "\nHTTP: {http}  |  P2P (torrent): {p2p}",
+        "gh_checking":          "GitHub: …",
+        "gh_uptodate":          "GitHub: ✓ up to date",
+        "gh_update":            "GitHub: update {v}",
+        "log_ext_ip":           "[APP] External IP: {ip}",
     },
     "ru": {
         "window_title":         "ModSync Server",
-        "grp_server":           "Сервер",
+        "grp_server":           "Настройки сервера",
+        "grp_build":            "Сборка и публикация",
         "grp_cache":            "Кэш",
         "grp_access":           "Контроль доступа",
         "lbl_mods_path":        "Папка модов:",
+        "tip_mods_path":        "Путь к папке Mods игрового сервера.",
+        "btn_select":           "Выбрать",
+        "btn_select_tip":       "Выбрать папку с модами",
         "lbl_port":             "Порт:",
+        "tip_port":             "HTTP-порт, на котором слушает сервер. Игроки подключаются к этому порту.",
+        "lbl_auto_port":        "Авто",
+        "tip_auto_port":        "ВКЛ: случайный свободный порт при каждом старте.\nВЫКЛ: использовать порт из поля выше.",
         "lbl_status_stopped":   "Остановлен",
         "lbl_status_running":   "Работает  ·  {ip}  📋",
         "lbl_status_tip":       "Нажмите чтобы скопировать IP",
@@ -1868,46 +1735,70 @@ TRANSLATIONS = {
         "lbl_whitelist":        "Вайтлист — разрешённые SteamID",
         "lbl_mods_summary":     "Обнаружено: {total}  ·  Выбрано: {sel}  ·  {size}",
         "lbl_blacklist":        "Чёрный список — заблокированные SteamID",
-        "btn_select":           "📁  Выбрать",
-        "btn_select_tip":       "Выбрать папку с модами",
         "btn_auto_port":        "Авто",
-        "btn_start":            "▶  Старт",
-        "btn_stop":             "■  Стоп",
+        "btn_start":            "Старт",
+        "btn_stop":             "Стоп",
         "btn_autostart_on":     "Автозапуск: ВКЛ",
         "btn_autostart_off":    "Автозапуск: ВЫКЛ",
-        "btn_upnp_off":         "🌐  UPnP: ВЫКЛ",
-        "btn_upnp_on":          "🌐  UPnP: ВКЛ",
-        "btn_upnp_failed":      "🌐  UPnP: ОШИБКА",
+        "btn_upnp_off":         "UPnP: ВЫКЛ",
+        "btn_upnp_on":          "UPnP: ВКЛ",
+        "btn_upnp_failed":      "UPnP: ERR",
         "btn_upnp_tip":         "Автоматически пробросить порт через UPnP.\nТребует роутер с включённым UPnP.",
         "btn_upnp_fail_tip":    "Не удалось автоматически пробросить порт {port}.\nОткройте порт вручную в настройках роутера:\n  Протокол: TCP\n  Внешний порт: {port}\n  Внутренний IP: {ip}\n  Внутренний порт: {port}",
         "btn_upnp_ok_tip":      "UPnP активен — внешний адрес {ip}:{port}",
-        "btn_apply_cache":      "✔  Применить",
-        "btn_scan":             "⟳  Сканировать",
-        "btn_purge":            "🗑  Очистить",
-        "btn_open_cache":       "📂  Открыть кэш",
-        "btn_open_cache_tip":   "Открыть папку кэша в Проводнике",
-        "btn_mode_open":        "🌐  Общий",
-        "btn_mode_wl":          "🛡  Вайтлист",
-        "btn_instr":            "📖  Настройка вайтлиста",
-        "btn_sync_auth":        "⟳  Синхронизировать",
-        "btn_copy_steamid":     "📋  Копировать SteamID",
-        "btn_ban":              "🚫  Бан",
+        "btn_apply_cache":      "Применить",
+        "btn_scan":             "Обновить",
+        "btn_scan_tip":         "Перечитать папку модов и обновить список файлов.\nПроисходит автоматически при изменении файлов.",
+        "btn_publish":          "Публикация",
+        "btn_publish_tip":      "Опубликовать текущий снапшот модов как новую сборку для скачивания клиентами.",
+        "btn_auto_publish":     "Автопубликация",
+        "tip_auto_publish":     "ВКЛ: изменения в папке модов публикуются автоматически через 5 сек.\nВЫКЛ: публикация только вручную.",
+        "lbl_build":            "Сборка:",
+        "lbl_listing":          "Публичный листинг",
+        "tip_listing":          "Зарегистрировать сервер на мастер-сервере (bar7dtd.ru), чтобы клиенты могли найти его автоматически.\nВ режиме Вайтлист сервер виден в списке, но обмен модами работает только с авторизованными игроками.",
+        "lbl_auto_publish":     "Автопубликация",
+        "lbl_server_name":      "Имя в листинге:",
+        "tip_server_name":      "Имя, отображаемое в публичном списке серверов. Оставьте пустым для чтения из serverconfig.xml.",
+        "lbl_auto_port_colon":  "Авто:",
+        "lbl_seed_stats":       "пиров: {peers} · отдано: {mb:.1f} МБ · {kb:.0f} КБ/с",
+        "lbl_log_title":        "Лог сервера",
+        "btn_clear_log":        "Очистить",
+        "log_auto_pub_on":      "[APP] Автопубликация включена",
+        "log_auto_pub_off":     "[APP] Автопубликация выключена",
+        "btn_mode_open":        "Общий",
+        "tip_mode_open":        "Все игроки со Steam-аккаунтом могут скачивать моды.",
+        "btn_mode_wl":          "Вайтлист",
+        "tip_mode_wl":          "Только SteamID из вашего вайтлиста могут скачивать моды.",
+        "btn_instr":            "Настройка вайтлиста",
+        "btn_sync_auth":        "Синхронизировать",
+        "tip_sync_auth":        "Загрузить вайтлист с Auth URL прямо сейчас.",
+        "btn_copy_steamid":     "Копировать SteamID",
+        "btn_ban":              "Бан",
         "btn_ban_tip":          "Добавить SteamID в чёрный список",
-        "btn_unban":            "✅  Разбан",
-        "btn_copy_allowed":     "📋  Копировать SteamID",
+        "btn_unban":            "Разбан",
+        "btn_copy_allowed":     "Копировать SteamID",
         "btn_mods_all":         "Все",
         "btn_mods_none":        "Ничего",
-        "btn_mods_apply":       "✔  Применить",
-        "btn_lang":             "🌐 EN",
+        "btn_mods_apply":       "Применить",
+        "btn_lang":             "EN",
+        "btn_tooltips_on":      "Подсказки: ВКЛ",
+        "btn_tooltips_off":     "Подсказки: ВЫКЛ",
+        "tip_tooltips":         "Показывать/скрывать подсказки при наведении.",
+        "lbl_update":           "Доступна версия {v}",
+        "btn_download_update":  "↗ Скачать",
+        # Tabs
         "tab_clients":          "Клиенты",
         "tab_whitelist":        "Вайтлист",
         "tab_mods":             "Моды",
         "tab_blacklist":        "Чёрный список",
+        "tab_logs":             "Логи",
+        # Table headers
         "th_steamid":           "SteamID",
         "th_last_seen":         "Последний визит",
         "th_ip":                "IP",
         "th_status":            "Статус",
-        "th_sent":              "Отправлено",
+        "th_build":             "Сборка",
+        "th_p2p":               "P2P",
         "th_mod_name":          "Мод",
         "th_files":             "Файлы",
         "th_size":              "Размер",
@@ -1925,10 +1816,66 @@ TRANSLATIONS = {
         "upnp_enabled_log":     "[UPnP] Включён — порт будет пробит при следующем старте сервера.",
         "upnp_disabled_log":    "[UPnP] Отключён.",
         "upnp_restore_tip":     "Автоматически пробросить порт через UPnP.\nТребует роутер с включённым UPnP.",
+        # Tooltips
+        "tip_mods_path":        "Путь к папке Mods игрового сервера.",
+        "tip_serverconfig":     "Выбрать serverconfig.xml для автоматического чтения имени сервера.",
+        "tip_start":            "Запустить HTTP-сервер и начать раздачу модов.",
+        "tip_stop":             "Остановить сервер.",
+        "tip_autostart":        "Автоматически запускать сервер при входе в Windows.",
+        "tip_ms_help":          "Что такое мастер-сервер?",
+        "tip_copy_steamid":     "Скопировать SteamID выбранного игрока в буфер обмена.",
+        "tip_copy_allowed":     "Скопировать выбранный SteamID из вайтлиста.",
+        "tip_bl_add":           "Добавить SteamID в чёрный список.",
+        "tip_bl_remove":        "Убрать выбранный SteamID из чёрного списка.",
+        "tip_instr":            "Открыть руководство по настройке вайтлиста.",
+        # Master server dialog
+        "dlg_ms_help_title":    "Мастер-сервер ModSync",
+        "dlg_ms_help_text": (
+            "<b>Что такое мастер-сервер?</b><br><br>"
+            "Мастер-сервер — это центральный реестр ModSync-серверов на bar7dtd.ru.<br><br>"
+            "<b>Что даёт публичный листинг:</b><br>"
+            "• Клиенты ModSync смогут найти ваш сервер автоматически — "
+            "без ручного ввода адреса.<br>"
+            "• Ваш сервер участвует в кросс-раздаче: клиенты других серверов "
+            "могут скачивать общие файлы модов у ваших игроков, снижая нагрузку на вас.<br><br>"
+            "<b>Что передаётся на мастер-сервер:</b><br>"
+            "• Название сервера, IP-адрес и порт ModSync.<br>"
+            "• build_id и список root-хешей файлов сборки (без содержимого файлов).<br>"
+            "• Heartbeat каждые 5 минут (онлайн/офлайн).<br><br>"
+            "<b>Приватность:</b> если листинг выключен — никакие данные "
+            "не передаются и сервер не виден в списке."
+        ),
+        # Build status
+        "v2_publishing":        "публикация…",
+        "v2_not_published":     "не опубликована",
+        "v2_has_changes":       "{build_id} · есть неопубликованные изменения",
+        "v2_published":         "{build_id} · {fc} файлов · опубликована",
+        # Restart watch
+        "lbl_wl_hint_listing":  "ℹ Whitelist: виден в списке, но раздача только авторизованным игрокам",
+        "lbl_restart_watch":    "Отслеживать рестарт",
+        "tip_restart_watch":    (
+            "Следить за PID процесса 7DaysToDieServer.exe каждые 30 сек.\n"
+            "При смене PID (рестарт сервера) — публикуем новый билд через 10 сек,\n"
+            "чтобы игроки получили актуальные моды перед входом."
+        ),
+        "log_rw_on":            "[APP] Отслеживание рестарта сервера включено",
+        "log_rw_off":           "[APP] Отслеживание рестарта сервера выключено",
+        "log_rw_restarted":     "[APP] Сервер перезапущен (новый PID: {pid}) — публикация через 10 сек…",
+        "log_rw_republish":     "[APP] Автоматическая публикация после рестарта сервера",
+        "dlg_close_title":      "Остановить сервер?",
+        "dlg_close_text":       "HTTP-сервер сейчас работает. Клиенты не смогут синхронизироваться.\n\nОстановить сервер и закрыть приложение?",
+        "lbl_status_tip_ports": "\nHTTP: {http}  |  P2P (торрент): {p2p}",
+        "gh_checking":          "GitHub: …",
+        "gh_uptodate":          "GitHub: ✓ актуально",
+        "gh_update":            "GitHub: обновление {v}",
+        "log_ext_ip":           "[APP] Внешний IP: {ip}",
     },
 }
 
 class ServerWindow(QWidget):
+    _gh_status_signal  = pyqtSignal(str, str)  # (text, css_color)
+    _status_lbl_signal = pyqtSignal(str)       # (ip:port text)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ModSync Server")
@@ -1945,6 +1892,10 @@ class ServerWindow(QWidget):
         self.manifest_bridge = ManifestBridge()
         self.manifest_bridge.manifest_ready.connect(self.on_manifest_ready)
 
+        self.pub_progress_bridge = PublishProgressBridge()
+        self.pub_progress_bridge.progress.connect(self._on_publish_progress)
+        self.pub_progress_bridge.done.connect(self._on_publish_done)
+
         cfg = read_config()
         auth_url = cfg.get("auth_url", "")
         auth_key = cfg.get("auth_key", "")
@@ -1955,9 +1906,6 @@ class ServerWindow(QWidget):
         mods_path = cfg.get("mods_path", DEFAULT_MODS_PATH)
         port = int(cfg.get("port", DEFAULT_PORT))
 
-        cache_max_gb = int(cfg.get("cache_max_gb", DEFAULT_CACHE_MAX_GB))
-        keep_mod_versions = int(cfg.get("keep_mod_versions", DEFAULT_KEEP_MOD_VERSIONS))
-        bundle_ttl_days = int(cfg.get("bundle_ttl_days", DEFAULT_BUNDLE_TTL_DAYS))
         tracked_mods = cfg.get("tracked_mods", None)  # None = ещё не задано
 
         mods_root = Path(mods_path)
@@ -1972,15 +1920,12 @@ class ServerWindow(QWidget):
         self.state = ServerState(
             manifest=build_manifest(mods_root, tracked_set),
             cache_cfg={
-                "cache_max_gb": cache_max_gb,
-                "keep_mod_versions": keep_mod_versions,
-                "bundle_ttl_days": bundle_ttl_days,
                 "auth": {
                     "auth_url": auth_url,
                     "auth_key": auth_key,
                     "auth_refresh_hours": auth_refresh_hours,
                     "auth_fail_open": auth_fail_open,
-                "auth_mode": auth_mode
+                    "auth_mode": auth_mode,
                 }
             },
             tracked_mods=tracked_set
@@ -1990,6 +1935,11 @@ class ServerWindow(QWidget):
         self.host = "0.0.0.0"
         self._running_ip = ""
 
+        # ── V2: сборки + торрент ──
+        self.state.v2 = modsync_v2.V2State(APPDATA_DIR)
+        self.state.publish_trigger = self.trigger_publish
+        self._publish_thread: threading.Thread | None = None
+
         # watcher + debounce
         self.fs_watcher = QFileSystemWatcher()
         self.fs_watcher.directoryChanged.connect(self.on_fs_changed)
@@ -1998,11 +1948,6 @@ class ServerWindow(QWidget):
         self.rescan_debounce = QTimer(self)
         self.rescan_debounce.setSingleShot(True)
         self.rescan_debounce.timeout.connect(self.on_scan_async)
-
-        # cache stats timer
-        self.cache_timer = QTimer(self)
-        self.cache_timer.setInterval(2000)
-        self.cache_timer.timeout.connect(self.refresh_cache_label)
 
         # clients table timer
         self.clients_timer = QTimer(self)
@@ -2015,325 +1960,347 @@ class ServerWindow(QWidget):
         self.auth_timer.timeout.connect(self.on_auth_tick)
         self.auth_timer.start()
 
-        # ───────────────────────────────────────────────
-        # ВЕРХНЯЯ ПАНЕЛЬ: путь к модам + управление сервером
-        # ───────────────────────────────────────────────
-        self.server_group = QGroupBox("Server")
-        server_l = QVBoxLayout(self.server_group)
-        server_l.setSpacing(8)
+        # v2: статус сборки + статистика сида + автопубликация (дебаунс)
+        self.v2_timer = QTimer(self)
+        self.v2_timer.setInterval(2000)
+        self.v2_timer.timeout.connect(self.on_v2_tick)
+        self.v2_timer.start()
 
-        # Строка 1: путь + кнопка выбора папки
-        row1 = QHBoxLayout()
-        self.lbl_mods_path = QLabel("Mods path:")
-        self.lbl_mods_path.setStyleSheet("color: #7aa2f7; font-size: 11px; font-weight: bold;")
-        row1.addWidget(self.lbl_mods_path)
+        self._auto_pub_timer = QTimer(self)
+        self._auto_pub_timer.setSingleShot(True)
+        self._auto_pub_timer.timeout.connect(self.trigger_publish)
+
+        # ─── BLOCK 1: Mods folder (full width) ───
+        card1, c1, _ = _make_card()
+        r_mods = QHBoxLayout()
+        r_mods.setSpacing(8)
+        self.lbl_mods_path = QLabel("Папка модов:")
+        self.lbl_mods_path.setStyleSheet("color: #5a6070; font-size: 11px;")
+        r_mods.addWidget(self.lbl_mods_path)
         self.mods_edit = QLineEdit(mods_path)
         self.mods_edit.setMinimumWidth(200)
-        row1.addWidget(self.mods_edit, 1)
-
-        self.select_mods_btn = QPushButton("📁  Select")
+        self.mods_edit.setToolTip("Путь к папке Mods игрового сервера.")
+        r_mods.addWidget(self.mods_edit, 1)
+        self.select_mods_btn = QPushButton("Выбрать")
         self.select_mods_btn.setObjectName("scan_btn")
-        self.select_mods_btn.setToolTip("Select mods folder")
+        self.select_mods_btn.setToolTip("Выбрать папку с модами")
         self.select_mods_btn.clicked.connect(self.on_select_mods_folder)
-        row1.addWidget(self.select_mods_btn)
-        server_l.addLayout(row1)
+        r_mods.addWidget(self.select_mods_btn)
+        c1.addLayout(r_mods)
 
-        # Строка 2: порт + кнопки + статус
-        row2 = QHBoxLayout()
-        self.lbl_port = QLabel("Port:")
-        self.lbl_port.setStyleSheet("color: #7aa2f7; font-size: 11px; font-weight: bold;")
-        row2.addWidget(self.lbl_port)
+        # ─── Middle row: 3 cards ───
+        mid_row = QHBoxLayout()
+        mid_row.setSpacing(10)
+
+        # ── BLOCK 2: Server settings ──
+        card2, c2, self._card2_title_lbl = _make_card(self.tr("grp_server"))
+
+        _auto_name = read_server_name_from_config(mods_path)
+        _saved_name = cfg.get("server_name", "")
+        _initial_name = _saved_name or _auto_name or ""
+        r_sname = QHBoxLayout()
+        self.lbl_sname_w = QLabel(self.tr("lbl_server_name"))
+        self.lbl_sname_w.setStyleSheet("color: #5a6070; font-size: 11px;")
+        r_sname.addWidget(self.lbl_sname_w)
+        self.server_name_edit = QLineEdit(_initial_name)
+        self.server_name_edit.setPlaceholderText("Из serverconfig.xml…")
+        self.server_name_edit.setToolTip("Имя, отображаемое в публичном списке серверов.")
+        self.server_name_edit.textChanged.connect(self._on_server_name_changed)
+        r_sname.addWidget(self.server_name_edit, 1)
+        self.select_serverconfig_btn = QPushButton("…")
+        self.select_serverconfig_btn.setObjectName("scan_btn")
+        self.select_serverconfig_btn.setFixedWidth(34)
+        self.select_serverconfig_btn.setToolTip("Выбрать serverconfig.xml вручную")
+        self.select_serverconfig_btn.clicked.connect(self.on_select_serverconfig)
+        r_sname.addWidget(self.select_serverconfig_btn)
+        c2.addLayout(r_sname)
+
+        r_port = QHBoxLayout()
+        r_port.setSpacing(8)
+        self.lbl_port = QLabel("Порт:")
+        self.lbl_port.setStyleSheet("color: #5a6070; font-size: 11px;")
+        r_port.addWidget(self.lbl_port)
         self.port_edit = QLineEdit(str(port))
-        self.port_edit.setFixedWidth(80)
-        row2.addWidget(self.port_edit)
-
-        self.auto_port_btn = QPushButton("Auto")
-        self.auto_port_btn.setFixedWidth(60)
-        self.auto_port_btn.clicked.connect(self.on_auto_port)
-        row2.addWidget(self.auto_port_btn)
-
-        row2.addSpacing(16)
-
-        self.start_btn = QPushButton("▶  Start")
-        self.start_btn.setObjectName("start_btn")
-        self.start_btn.setFixedWidth(100)
-        self.start_btn.clicked.connect(self.on_start)
-        row2.addWidget(self.start_btn)
-
-        self.stop_btn = QPushButton("■  Stop")
-        self.stop_btn.setObjectName("stop_btn")
-        self.stop_btn.setFixedWidth(100)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.on_stop)
-        row2.addWidget(self.stop_btn)
-
-        self.autostart_btn = QPushButton("Autostart: OFF")
-        self.autostart_btn.setCheckable(True)
-        self.autostart_btn.clicked.connect(self.on_toggle_autostart)
-        row2.addWidget(self.autostart_btn)
-
-        self.upnp_btn = QPushButton("🌐  UPnP: OFF")
-        self.upnp_btn.setCheckable(True)
-        self.upnp_btn.setToolTip(
-            "Автоматически пробросить порт через UPnP.\n"
-            "Требует роутер с включённым UPnP."
+        self.port_edit.setFixedWidth(70)
+        self.port_edit.setToolTip("HTTP-порт сервера.")
+        r_port.addWidget(self.port_edit)
+        self.lbl_auto_port_label = QLabel(self.tr("lbl_auto_port_colon"))
+        self.lbl_auto_port_label.setStyleSheet("color: #5a6070; font-size: 11px; margin-left:6px;")
+        r_port.addWidget(self.lbl_auto_port_label)
+        _auto_port_on = bool(cfg.get("auto_port", False))
+        self.auto_port_btn = ToggleSwitch(checked=_auto_port_on)
+        self.auto_port_btn.setToolTip(
+            "ВКЛ: случайный свободный порт при каждом старте.\n"
+            "ВЫКЛ: использовать порт из поля выше."
         )
-        self.upnp_btn.clicked.connect(self.on_toggle_upnp)
-        row2.addWidget(self.upnp_btn)
+        self.auto_port_btn.toggled.connect(self.on_auto_port)
+        r_port.addWidget(self.auto_port_btn)
+        if _auto_port_on:
+            self.port_edit.setEnabled(False)
+        r_port.addStretch(1)
+        c2.addLayout(r_port)
 
-        self.lang_btn = QPushButton("🌐 EN")
-        self.lang_btn.setFixedWidth(66)
-        self.lang_btn.clicked.connect(self.on_toggle_lang)
-        row2.addWidget(self.lang_btn)
-        self._lang = cfg.get("lang", "ru")
-        self._upnp_enabled = bool(cfg.get("upnp_enabled", False))
-        self._upnp_failed = bool(cfg.get("upnp_failed", False))
-        self._upnp_port: int | None = None
-        if self._upnp_enabled:
-            self.upnp_btn.setChecked(True)
-            self.upnp_btn.setText("🌐  UPnP: ON")
-        if self._upnp_failed:
-            self.upnp_btn.setEnabled(False)
-            self.upnp_btn.setText("🌐  UPnP: FAILED")
-            port_val = cfg.get("port", 8765)
-            lan_ip = cfg.get("mods_path", "")  # placeholder, real IP at runtime
-            self.upnp_btn.setToolTip(
-                f"Не удалось автоматически пробросить порт {port_val}.\n"
-                "Откройте порт вручную в настройках роутера:\n"
-                f"  Протокол: TCP\n"
-                f"  Внешний порт: {port_val}\n"
-                f"  Внутренний порт: {port_val}"
-            )
+        r_ss = QHBoxLayout()
+        r_ss.setSpacing(8)
+        self.start_btn = QPushButton("Старт")
+        self.start_btn.setObjectName("start_btn")
+        self.start_btn.setToolTip("Запустить HTTP-сервер и начать раздачу модов.")
+        self.start_btn.clicked.connect(self.on_start)
+        r_ss.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("Стоп")
+        self.stop_btn.setObjectName("stop_btn")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setToolTip("Остановить сервер.")
+        self.stop_btn.clicked.connect(self.on_stop)
+        r_ss.addWidget(self.stop_btn)
+        c2.addLayout(r_ss)
 
-        row2.addSpacing(16)
-
+        r_status = QHBoxLayout()
+        r_status.setSpacing(6)
         self.status_light = StatusLight()
-        row2.addWidget(self.status_light)
-
-        # Статус — кликабельный лейбл (копирует IP в буфер)
-        self.status_lbl = QLabel("Stopped")
-        self.status_lbl.setStyleSheet("color: #f85149; font-weight: bold; font-size: 13px;")
+        r_status.addWidget(self.status_light)
+        self.status_lbl = QLabel("Остановлен")
+        self.status_lbl.setObjectName("status_stop")
+        self.status_lbl.setToolTip("Нажмите чтобы скопировать IP")
         self.status_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
         self.status_lbl.mousePressEvent = self._on_status_lbl_click
-        row2.addWidget(self.status_lbl)
+        r_status.addWidget(self.status_lbl)
+        r_status.addStretch(1)
+        c2.addLayout(r_status)
 
-        row2.addStretch(1)
-        server_l.addLayout(row2)
+        r_aux = QHBoxLayout()
+        r_aux.setSpacing(6)
+        self.autostart_btn = QPushButton("Автозапуск: ВЫКЛ")
+        self.autostart_btn.setCheckable(True)
+        self.autostart_btn.setToolTip("Автоматически запускать сервер при входе в Windows.")
+        self.autostart_btn.clicked.connect(self.on_toggle_autostart)
+        r_aux.addWidget(self.autostart_btn)
+        self.upnp_btn = QPushButton("UPnP: ВЫКЛ")
+        self.upnp_btn.setCheckable(True)
+        self.upnp_btn.setToolTip("Автоматически пробросить порт через UPnP.\nТребует роутер с включённым UPnP.")
+        self.upnp_btn.clicked.connect(self.on_toggle_upnp)
+        r_aux.addWidget(self.upnp_btn)
+        c2.addLayout(r_aux)
 
-        # ───────────────────────────────────────────────
-        # НАСТРОЙКИ КЭША
-        # ───────────────────────────────────────────────
-        def _spin(layout, val, lo, hi, attr_name):
-            """Добавляет ◀ поле ▶ прямо в layout, без обёрток."""
-            minus = QPushButton("◀"); minus.setObjectName("spin_btn"); minus.setFixedSize(20, 24)
-            edit = QLineEdit(str(val)); edit.setFixedSize(50, 24); edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            plus = QPushButton("▶"); plus.setObjectName("spin_btn"); plus.setFixedSize(20, 24)
-            layout.addWidget(minus); layout.addWidget(edit); layout.addWidget(plus)
-            setattr(self, attr_name, edit)
-            def _safe_inc():
-                try: edit.setText(str(min(int(edit.text()) + 1, hi)))
-                except Exception: pass
-            def _safe_dec():
-                try: edit.setText(str(max(int(edit.text()) - 1, lo)))
-                except Exception: pass
-            plus.clicked.connect(_safe_inc)
-            minus.clicked.connect(_safe_dec)
+        mid_row.addWidget(card2, 2)
 
-        def _clbl(text):
-            l = QLabel(text); l.setStyleSheet("color: #8b9ebe; font-size: 12px;")
-            return l
+        # ── BLOCK 3: Build & Publish ──
+        card3, c3, self._card3_title_lbl = _make_card(self.tr("grp_build"))
 
-        self.cache_group = QGroupBox("Cache Policy")
-        cache_vl = QVBoxLayout(self.cache_group)
-        cache_vl.setSpacing(5)
-        cache_vl.setContentsMargins(12, 6, 12, 8)
+        r_build = QHBoxLayout()
+        self.lbl_v2 = QLabel("Сборка:")
+        self.lbl_v2.setStyleSheet("color: #5a6070; font-size: 11px;")
+        r_build.addWidget(self.lbl_v2)
+        self.v2_status_lbl = QLabel("—")
+        self.v2_status_lbl.setStyleSheet("color: #8898b8; font-size: 12px;")
+        r_build.addWidget(self.v2_status_lbl, 1)
+        c3.addLayout(r_build)
 
-        # Строка 1: Max size: [+] 20 [−]  ▓░░ 8% used  Cache: 1.73 GB…
-        r1 = QHBoxLayout(); r1.setSpacing(8); r1.setContentsMargins(0,0,0,0)
-        self.lbl_cache_max = _clbl("Max size:")
-        r1.addWidget(self.lbl_cache_max)
-        _spin(r1, cache_max_gb, 1, 500, "cache_max_edit")
-        self.cache_bar = QProgressBar()
-        self.cache_bar.setObjectName("cache_bar")
-        self.cache_bar.setRange(0, 100); self.cache_bar.setValue(0)
-        self.cache_bar.setFormat("%p%  used"); self.cache_bar.setFixedWidth(140)
-        self.cache_bar.setFixedHeight(24)
-        r1.addWidget(self.cache_bar)
-        self.cache_lbl = QLabel("Cache: …"); self.cache_lbl.setStyleSheet("color: #8b9ebe; font-size: 11px;")
-        r1.addWidget(self.cache_lbl)
-        r1.addStretch(1)
-        cache_vl.addLayout(r1)
+        self.v2_seed_lbl = QLabel("")
+        self.v2_seed_lbl.setStyleSheet("color: #3d4458; font-size: 11px;")
+        c3.addWidget(self.v2_seed_lbl)
 
-        # Строка 2: Keep versions: [+] 5 [−]
-        r2 = QHBoxLayout(); r2.setSpacing(8); r2.setContentsMargins(0,0,0,0)
-        self.lbl_keep_ver = _clbl("Keep versions:")
-        r2.addWidget(self.lbl_keep_ver)
-        _spin(r2, keep_mod_versions, 1, 10, "keep_versions_edit")
-        r2.addStretch(1)
-        cache_vl.addLayout(r2)
+        r_listing = QHBoxLayout()
+        r_listing.setSpacing(8)
+        self.lbl_listing_w = QLabel(self.tr("lbl_listing") + ":")
+        self.lbl_listing_w.setStyleSheet("color: #5a6070; font-size: 12px;")
+        r_listing.addWidget(self.lbl_listing_w)
+        self.ms_listing_chk = ToggleSwitch(checked=bool(cfg.get("ms_listing", False)))
+        self.ms_listing_chk.setToolTip(
+            "Зарегистрировать сервер на мастер-сервере (bar7dtd.ru).\n"
+            "В режиме Вайтлист виден в списке, но обмен модами только с авторизованными игроками."
+        )
+        self.ms_listing_chk.toggled.connect(self.on_ms_listing_toggled)
+        r_listing.addWidget(self.ms_listing_chk)
+        self.ms_help_btn = QPushButton("?")
+        self.ms_help_btn.setObjectName("help_btn")
+        self.ms_help_btn.setFixedSize(22, 22)
+        self.ms_help_btn.setToolTip("Что такое мастер-сервер?")
+        self.ms_help_btn.clicked.connect(self.on_ms_help)
+        r_listing.addWidget(self.ms_help_btn)
+        r_listing.addStretch(1)
+        self.ms_status_lbl = QLabel("")
+        self.ms_status_lbl.setStyleSheet("color: #3d4458; font-size: 11px;")
+        r_listing.addWidget(self.ms_status_lbl)
+        c3.addLayout(r_listing)
 
-        # Строка 3: Bundle TTL (days): [+] 14 [−]
-        r3 = QHBoxLayout(); r3.setSpacing(8); r3.setContentsMargins(0,0,0,0)
-        self.lbl_ttl = _clbl("Bundle TTL (days):")
-        r3.addWidget(self.lbl_ttl)
-        _spin(r3, bundle_ttl_days, 0, 365, "bundle_ttl_edit")
-        r3.addStretch(1)
-        cache_vl.addLayout(r3)
+        self.ms_listing_wl_hint = QLabel(self.tr("lbl_wl_hint_listing"))
+        self.ms_listing_wl_hint.setStyleSheet("color: #5a7494; font-size: 11px;")
+        self.ms_listing_wl_hint.setVisible(False)
+        c3.addWidget(self.ms_listing_wl_hint)
 
-        # Строка 4: кнопки (левый край)
-        r4 = QHBoxLayout(); r4.setSpacing(8); r4.setContentsMargins(0,0,0,0)
+        r_ap = QHBoxLayout()
+        r_ap.setSpacing(8)
+        self.lbl_auto_pub_label = QLabel(self.tr("lbl_auto_publish") + ":")
+        self.lbl_auto_pub_label.setStyleSheet("color: #5a6070; font-size: 12px;")
+        r_ap.addWidget(self.lbl_auto_pub_label)
+        self.auto_publish_chk = ToggleSwitch(checked=bool(cfg.get("auto_publish", False)))
+        self.auto_publish_chk.setToolTip(self.tr("tip_auto_publish"))
+        self.auto_publish_chk.toggled.connect(
+            lambda on: self.append_log(self.tr("log_auto_pub_on" if on else "log_auto_pub_off"))
+        )
+        r_ap.addWidget(self.auto_publish_chk)
+        r_ap.addStretch(1)
+        c3.addLayout(r_ap)
 
-        self.apply_cache_btn = QPushButton("✔  Apply")
-        self.apply_cache_btn.setObjectName("scan_btn")
-        self.apply_cache_btn.clicked.connect(self.on_apply_cache_settings)
-        r4.addWidget(self.apply_cache_btn)
+        self.publish_progress = QProgressBar()
+        self.publish_progress.setRange(0, 100)
+        self.publish_progress.setFixedHeight(8)
+        self.publish_progress.setTextVisible(False)
+        self.publish_progress.setVisible(False)
+        c3.addWidget(self.publish_progress)
 
-        self.scan_btn = QPushButton("⟳  Scan")
+        r_pub_btns = QHBoxLayout()
+        r_pub_btns.setSpacing(8)
+        self.scan_btn = QPushButton("Обновить")
         self.scan_btn.setObjectName("scan_btn")
+        self.scan_btn.setToolTip(
+            "Перечитать папку модов и обновить список файлов.\n"
+            "Происходит автоматически при изменении файлов."
+        )
         self.scan_btn.clicked.connect(self.on_scan_async)
-        r4.addWidget(self.scan_btn)
+        r_pub_btns.addWidget(self.scan_btn)
+        self.publish_btn = QPushButton("Публикация")
+        self.publish_btn.setObjectName("accent_btn")
+        self.publish_btn.setToolTip("Опубликовать текущий снапшот модов как новую сборку для скачивания.")
+        self.publish_btn.clicked.connect(self.on_publish_clicked)
+        r_pub_btns.addWidget(self.publish_btn)
+        c3.addLayout(r_pub_btns)
 
-        self.purge_btn = QPushButton("🗑  Purge")
-        self.purge_btn.setObjectName("purge_btn")
-        self.purge_btn.clicked.connect(self.on_purge_cache)
-        r4.addWidget(self.purge_btn)
+        r_rw = QHBoxLayout()
+        r_rw.setSpacing(8)
+        self.lbl_restart_watch_w = QLabel(self.tr("lbl_restart_watch") + ":")
+        self.lbl_restart_watch_w.setStyleSheet("color: #5a6070; font-size: 12px;")
+        r_rw.addWidget(self.lbl_restart_watch_w)
+        self.restart_watch_chk = ToggleSwitch(checked=bool(cfg.get("restart_watch", False)))
+        self.restart_watch_chk.setToolTip(self.tr("tip_restart_watch"))
+        self.restart_watch_chk.toggled.connect(self._on_restart_watch_toggled)
+        r_rw.addWidget(self.restart_watch_chk)
+        r_rw.addStretch(1)
+        c3.addLayout(r_rw)
 
-        self.open_cache_btn = QPushButton("📂  Open Cache")
-        self.open_cache_btn.setObjectName("scan_btn")
-        self.open_cache_btn.setToolTip("Open cache folder in Explorer")
-        self.open_cache_btn.clicked.connect(lambda: subprocess.Popen(f'explorer "{CACHE_DIR}"'))
-        r4.addWidget(self.open_cache_btn)
-        r4.addStretch(1)
-        cache_vl.addLayout(r4)
+        mid_row.addWidget(card3, 2)
 
-        # ───────────────────────────────────────────────
-        # AUTH BOX
-        # ───────────────────────────────────────────────
-        self.auth_group = QGroupBox("Access Control")
-        auth_l = QGridLayout(self.auth_group)
-        auth_l.setSpacing(8)
+        # ── BLOCK 4: Access Control ──
+        card4, c4, self._card4_title_lbl = _make_card(self.tr("grp_access"))
 
-        # Row 0 — mode selector
-        self.lbl_mode = QLabel("Mode:")
-        self.lbl_mode.setStyleSheet("color: #8b9ebe;")
-        auth_l.addWidget(self.lbl_mode, 0, 0)
-
+        r_mode = QHBoxLayout()
+        r_mode.setSpacing(6)
         auth_mode_val = cfg.get("auth_mode", "whitelist")
-        self.auth_mode_open_btn = QPushButton("🌐  Open")
+        self.auth_mode_open_btn = QPushButton("Общий")
         self.auth_mode_open_btn.setObjectName("mode_btn")
         self.auth_mode_open_btn.setCheckable(True)
         self.auth_mode_open_btn.setChecked(auth_mode_val == "open")
-        self.auth_mode_open_btn.setMinimumWidth(80)
-
-        self.auth_mode_wl_btn = QPushButton("🛡  Whitelist")
+        self.auth_mode_open_btn.setToolTip("Все игроки со Steam-аккаунтом могут скачивать моды.")
+        self.auth_mode_open_btn.clicked.connect(lambda: self._set_auth_mode("open"))
+        r_mode.addWidget(self.auth_mode_open_btn)
+        self.auth_mode_wl_btn = QPushButton("Вайтлист")
         self.auth_mode_wl_btn.setObjectName("mode_btn")
         self.auth_mode_wl_btn.setCheckable(True)
         self.auth_mode_wl_btn.setChecked(auth_mode_val == "whitelist")
-        self.auth_mode_wl_btn.setMinimumWidth(80)
-
-        self.auth_mode_open_btn.clicked.connect(lambda: self._set_auth_mode("open"))
+        self.auth_mode_wl_btn.setToolTip("Только SteamID из вашего вайтлиста могут скачивать моды.")
         self.auth_mode_wl_btn.clicked.connect(lambda: self._set_auth_mode("whitelist"))
-
-        mode_box = QHBoxLayout()
-        mode_box.setSpacing(4)
-        mode_box.addWidget(self.auth_mode_open_btn)
-        mode_box.addWidget(self.auth_mode_wl_btn)
-        mode_box.addStretch(1)
+        r_mode.addWidget(self.auth_mode_wl_btn)
+        r_mode.addStretch(1)
+        c4.addLayout(r_mode)
 
         self.auth_mode_hint = QLabel("")
-        self.auth_mode_hint.setStyleSheet("color: #a6e3a1; font-size: 11px;")
-        mode_box.addWidget(self.auth_mode_hint)
+        self.auth_mode_hint.setStyleSheet("color: #3d8a5e; font-size: 11px;")
+        c4.addWidget(self.auth_mode_hint)
 
-        self.instr_btn = QPushButton("📖  How to setup Whitelist")
-        self.instr_btn.clicked.connect(self.on_show_whitelist_instructions)
-        mode_box.addWidget(self.instr_btn)
-
-        auth_l.addLayout(mode_box, 0, 1, 1, 5)
-
-        # Row 1 — URL + key (whitelist only)
+        self._wl_config_frame = QFrame()
+        self._wl_config_frame.setStyleSheet("background: transparent;")
+        wl_cfg_l = QVBoxLayout(self._wl_config_frame)
+        wl_cfg_l.setContentsMargins(0, 4, 0, 0)
+        wl_cfg_l.setSpacing(6)
+        r_url = QHBoxLayout()
         self.lbl_auth_url_w = QLabel("Auth URL:")
-        self.lbl_auth_url_w.setStyleSheet("color: #8b9ebe;")
-        auth_l.addWidget(self.lbl_auth_url_w, 1, 0)
+        self.lbl_auth_url_w.setStyleSheet("color: #5a6070; font-size: 11px;")
+        r_url.addWidget(self.lbl_auth_url_w)
         self.auth_url_edit = QLineEdit(auth_url)
         self.auth_url_edit.setPlaceholderText("https://yoursite.com/api/modsync/allowed_steamids")
-        auth_l.addWidget(self.auth_url_edit, 1, 1, 1, 5)
-
+        r_url.addWidget(self.auth_url_edit, 1)
+        wl_cfg_l.addLayout(r_url)
+        r_key = QHBoxLayout()
         self.lbl_auth_key_w = QLabel("Auth Key:")
-        self.lbl_auth_key_w.setStyleSheet("color: #8b9ebe;")
-        auth_l.addWidget(self.lbl_auth_key_w, 2, 0)
+        self.lbl_auth_key_w.setStyleSheet("color: #5a6070; font-size: 11px;")
+        r_key.addWidget(self.lbl_auth_key_w)
         self.auth_key_edit = QLineEdit(auth_key)
         self.auth_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.auth_key_edit.setPlaceholderText("secret key…")
-        auth_l.addWidget(self.auth_key_edit, 2, 1, 1, 3)
-
-        self.sync_auth_btn = QPushButton("⟳  Sync SteamIDs")
+        self.auth_key_edit.setPlaceholderText("секретный ключ…")
+        r_key.addWidget(self.auth_key_edit, 1)
+        self.sync_auth_btn = QPushButton("Sync")
         self.sync_auth_btn.setObjectName("scan_btn")
+        self.sync_auth_btn.setToolTip("Загрузить вайтлист с Auth URL прямо сейчас.")
         self.sync_auth_btn.clicked.connect(self.on_sync_auth_now)
-        auth_l.addWidget(self.sync_auth_btn, 2, 4)
+        r_key.addWidget(self.sync_auth_btn)
+        wl_cfg_l.addLayout(r_key)
+        self.auth_status_lbl = QLabel("Авторизация: …")
+        self.auth_status_lbl.setStyleSheet("color: #5a6070; font-size: 11px;")
+        wl_cfg_l.addWidget(self.auth_status_lbl)
+        c4.addWidget(self._wl_config_frame)
 
-        self.auth_status_lbl = QLabel("Auth: …")
-        self.auth_status_lbl.setStyleSheet("color: #8b9ebe; font-size: 11px;")
-        auth_l.addWidget(self.auth_status_lbl, 2, 5)
+        self.instr_btn = QPushButton("Настройка вайтлиста")
+        self.instr_btn.setToolTip("Открыть руководство по настройке вайтлиста.")
+        self.instr_btn.clicked.connect(self.on_show_whitelist_instructions)
+        c4.addWidget(self.instr_btn)
 
-        # Группируем виджеты строк для show/hide
         self._auth_url_row_widgets = [self.lbl_auth_url_w, self.auth_url_edit]
         self._auth_key_row_widgets = [self.lbl_auth_key_w, self.auth_key_edit,
                                        self.sync_auth_btn, self.auth_status_lbl]
+        # stub for compat
+        self.lbl_mode = QLabel()
+        self.lbl_mode.setVisible(False)
 
         self._apply_auth_mode_ui(auth_mode_val)
+        mid_row.addWidget(card4, 2)
 
-        # ───────────────────────────────────────────────
-        # ТАБЛИЦА КЛИЕНТОВ
-        # ───────────────────────────────────────────────
+        # ─── BLOCK 5: Tabs ───
         clients_box = QWidget()
         clients_l = QVBoxLayout(clients_box)
-        clients_l.setContentsMargins(0, 0, 0, 0)
-
+        clients_l.setContentsMargins(8, 8, 8, 4)
         clients_header = QHBoxLayout()
-        self.lbl_clients = QLabel("Connected Clients")
-        self.lbl_clients.setStyleSheet("font-weight: bold; color: #7aa2f7; font-size: 12px;")
+        self.lbl_clients = QLabel("Подключённые клиенты")
+        self.lbl_clients.setStyleSheet("font-weight: 600; color: #7aa2f7; font-size: 12px;")
         clients_header.addWidget(self.lbl_clients)
         clients_header.addStretch(1)
         self.copy_btn = QPushButton("📋  Copy SteamID")
+        self.copy_btn.setToolTip("Скопировать SteamID выбранного игрока.")
         self.copy_btn.clicked.connect(self.on_copy_steamid)
         clients_header.addWidget(self.copy_btn)
         self.ban_from_clients_btn = QPushButton("🚫  Ban")
-        self.ban_from_clients_btn.setToolTip("Add selected SteamID to blacklist")
+        self.ban_from_clients_btn.setToolTip("Добавить выбранный SteamID в чёрный список.")
         self.ban_from_clients_btn.clicked.connect(self.on_ban_from_clients)
         clients_header.addWidget(self.ban_from_clients_btn)
         clients_l.addLayout(clients_header)
-
-        self.clients_table = QTableWidget(0, 5)
-        self.clients_table.setHorizontalHeaderLabels(["SteamID", "Last Seen", "IP", "Status", "Sent"])
+        self.clients_table = QTableWidget(0, 6)
+        self.clients_table.setHorizontalHeaderLabels(["SteamID", "Last Seen", "IP", "Status", "Build", "P2P"])
         hdr_c = self.clients_table.horizontalHeader()
-        hdr_c.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr_c.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         hdr_c.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         hdr_c.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         hdr_c.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hdr_c.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        hdr_c.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr_c.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self.clients_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.clients_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.clients_table.setAlternatingRowColors(True)
         self.clients_table.cellDoubleClicked.connect(self._on_client_double_click)
         clients_l.addWidget(self.clients_table, 1)
 
-        # ───────────────────────────────────────────────
-        # WHITELIST
-        # ───────────────────────────────────────────────
         allowed_box = QWidget()
         allowed_l = QVBoxLayout(allowed_box)
-        allowed_l.setContentsMargins(0, 0, 0, 0)
-
+        allowed_l.setContentsMargins(8, 8, 8, 4)
         allowed_header = QHBoxLayout()
-        self.lbl_whitelist = QLabel("Whitelist — Allowed SteamIDs")
-        self.lbl_whitelist.setStyleSheet("font-weight: bold; color: #7aa2f7; font-size: 12px;")
+        self.lbl_whitelist = QLabel("Вайтлист — разрешённые SteamID")
+        self.lbl_whitelist.setStyleSheet("font-weight: 600; color: #7aa2f7; font-size: 12px;")
         allowed_header.addWidget(self.lbl_whitelist)
         allowed_header.addStretch(1)
         self.copy_allowed_btn = QPushButton("📋  Copy SteamID")
+        self.copy_allowed_btn.setToolTip("Скопировать SteamID из вайтлиста.")
         self.copy_allowed_btn.clicked.connect(self.on_copy_allowed_steamid)
         allowed_header.addWidget(self.copy_allowed_btn)
         allowed_l.addLayout(allowed_header)
-
         self.allowed_table = QTableWidget(0, 1)
         self.allowed_table.setHorizontalHeaderLabels(["SteamID"])
         self.allowed_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -2342,31 +2309,55 @@ class ServerWindow(QWidget):
         self.allowed_table.setAlternatingRowColors(True)
         allowed_l.addWidget(self.allowed_table, 1)
 
-        # --- Mods tab
-        mods_box = QWidget()
-        mods_l = QVBoxLayout()
-        mods_box.setLayout(mods_l)
+        blacklist_box = QWidget()
+        blacklist_l = QVBoxLayout(blacklist_box)
+        blacklist_l.setContentsMargins(8, 8, 8, 4)
+        bl_header = QHBoxLayout()
+        self.lbl_blacklist = QLabel("Чёрный список — заблокированные SteamID")
+        self.lbl_blacklist.setStyleSheet("font-weight: 600; color: #f38ba8; font-size: 12px;")
+        bl_header.addWidget(self.lbl_blacklist)
+        bl_header.addStretch(1)
+        self.bl_add_edit = QLineEdit()
+        self.bl_add_edit.setPlaceholderText("SteamID…")
+        self.bl_add_edit.setFixedWidth(160)
+        bl_header.addWidget(self.bl_add_edit)
+        self.bl_add_btn = QPushButton("🚫  Ban")
+        self.bl_add_btn.setToolTip("Добавить SteamID в чёрный список.")
+        self.bl_add_btn.clicked.connect(self.on_blacklist_add)
+        bl_header.addWidget(self.bl_add_btn)
+        self.bl_remove_btn = QPushButton("✅  Unban")
+        self.bl_remove_btn.setToolTip("Убрать выбранный SteamID из чёрного списка.")
+        self.bl_remove_btn.clicked.connect(self.on_blacklist_remove)
+        bl_header.addWidget(self.bl_remove_btn)
+        blacklist_l.addLayout(bl_header)
+        self.blacklist_table = QTableWidget(0, 2)
+        self.blacklist_table.setHorizontalHeaderLabels(["SteamID", "Banned At"])
+        hdr_bl = self.blacklist_table.horizontalHeader()
+        hdr_bl.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr_bl.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.blacklist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.blacklist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.blacklist_table.setAlternatingRowColors(True)
+        blacklist_l.addWidget(self.blacklist_table, 1)
 
+        mods_box = QWidget()
+        mods_l = QVBoxLayout(mods_box)
+        mods_l.setContentsMargins(8, 8, 8, 4)
         mods_header = QHBoxLayout()
-        self.mods_summary_lbl = QLabel("Detected mods: …")
-        self.mods_summary_lbl.setStyleSheet("color: #8b9ebe; font-size: 11px;")
+        self.mods_summary_lbl = QLabel("Mods: …")
+        self.mods_summary_lbl.setStyleSheet("color: #5a6070; font-size: 11px;")
         mods_header.addWidget(self.mods_summary_lbl)
         mods_header.addStretch(1)
-
         self.mods_select_all_btn = QPushButton("All")
         self.mods_select_all_btn.clicked.connect(self.on_mods_select_all)
         mods_header.addWidget(self.mods_select_all_btn)
-
         self.mods_select_none_btn = QPushButton("None")
         self.mods_select_none_btn.clicked.connect(self.on_mods_select_none)
         mods_header.addWidget(self.mods_select_none_btn)
-
         self.mods_apply_btn = QPushButton("✔  Apply")
         self.mods_apply_btn.clicked.connect(self.on_mods_apply)
         mods_header.addWidget(self.mods_apply_btn)
-
         mods_l.addLayout(mods_header)
-
         self.mods_table = QTableWidget(0, 3)
         self.mods_table.setHorizontalHeaderLabels(["Mod Name", "Files", "Size"])
         hdr_m = self.mods_table.horizontalHeader()
@@ -2379,101 +2370,118 @@ class ServerWindow(QWidget):
         self.mods_table.verticalHeader().setDefaultSectionSize(26)
         self.mods_table.itemClicked.connect(self._on_mods_item_clicked)
         mods_l.addWidget(self.mods_table, 1)
-        # ───────────────────────────────────────────────
-        # ЛОГ
-        # ───────────────────────────────────────────────
+
         log_box = QWidget()
         log_l = QVBoxLayout(log_box)
-        log_l.setContentsMargins(0, 0, 0, 0)
+        log_l.setContentsMargins(8, 8, 8, 4)
         log_header = QHBoxLayout()
-        lbl_log = QLabel("Server Log")
-        lbl_log.setStyleSheet("font-weight: bold; color: #7aa2f7; font-size: 12px;")
-        log_header.addWidget(lbl_log)
+        self.lbl_log_title = QLabel(self.tr("lbl_log_title"))
+        self.lbl_log_title.setStyleSheet("font-weight: 600; color: #7aa2f7; font-size: 12px;")
+        log_header.addWidget(self.lbl_log_title)
         log_header.addStretch(1)
-        clear_log_btn = QPushButton("Clear")
-        clear_log_btn.setFixedWidth(60)
-        clear_log_btn.clicked.connect(lambda: self.log_view.clear())
-        log_header.addWidget(clear_log_btn)
+        self.clear_log_btn = QPushButton(self.tr("btn_clear_log"))
+        self.clear_log_btn.setMinimumWidth(80)
+        self.clear_log_btn.setToolTip(self.tr("btn_clear_log"))
+        self.clear_log_btn.clicked.connect(lambda: self.log_view.clear())
+        log_header.addWidget(self.clear_log_btn)
         log_l.addLayout(log_header)
-
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         log_l.addWidget(self.log_view, 1)
 
-        # ───────────────────────────────────────────────
-        # SPLITTER + TABS
-        # ───────────────────────────────────────────────
-        # ───────────────────────────────────────────────
-        # BLACKLIST TAB
-        # ───────────────────────────────────────────────
-        blacklist_box = QWidget()
-        blacklist_l = QVBoxLayout(blacklist_box)
-        blacklist_l.setContentsMargins(0, 0, 0, 0)
-
-        bl_header = QHBoxLayout()
-        self.lbl_blacklist = QLabel("Blacklist — Blocked SteamIDs")
-        self.lbl_blacklist.setStyleSheet("font-weight: bold; color: #f38ba8; font-size: 12px;")
-        bl_header.addWidget(self.lbl_blacklist)
-        bl_header.addStretch(1)
-
-        self.bl_add_edit = QLineEdit()
-        self.bl_add_edit.setPlaceholderText("SteamID…")
-        self.bl_add_edit.setFixedWidth(160)
-        bl_header.addWidget(self.bl_add_edit)
-
-        self.bl_add_btn = QPushButton("🚫  Ban")
-        self.bl_add_btn.clicked.connect(self.on_blacklist_add)
-        bl_header.addWidget(self.bl_add_btn)
-
-        self.bl_remove_btn = QPushButton("✅  Unban")
-        self.bl_remove_btn.clicked.connect(self.on_blacklist_remove)
-        bl_header.addWidget(self.bl_remove_btn)
-
-        blacklist_l.addLayout(bl_header)
-
-        self.blacklist_table = QTableWidget(0, 2)
-        self.blacklist_table.setHorizontalHeaderLabels(["SteamID", "Banned At"])
-        hdr_bl = self.blacklist_table.horizontalHeader()
-        hdr_bl.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hdr_bl.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.blacklist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.blacklist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.blacklist_table.setAlternatingRowColors(True)
-        blacklist_l.addWidget(self.blacklist_table, 1)
-
         self.tabs = QTabWidget()
-        self.tabs.addTab(clients_box, "👥  Clients")
-        self.tabs.addTab(allowed_box, "🛡  Whitelist")
-        self.tabs.addTab(blacklist_box, "🚫  Blacklist")
-        self.tabs.addTab(mods_box, "🔢  Mods")
+        self.tabs.addTab(clients_box,   "Clients")
+        self.tabs.addTab(allowed_box,   "Whitelist")
+        self.tabs.addTab(blacklist_box, "Blacklist")
+        self.tabs.addTab(mods_box,      "Mods")
+        self.tabs.addTab(log_box,       "Logs")
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.tabs)
-        splitter.addWidget(log_box)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        # ─── Status bar ───
+        sb_frame = QFrame()
+        sb_frame.setObjectName("statusbar")
+        sb_l = QHBoxLayout(sb_frame)
+        sb_l.setContentsMargins(12, 0, 12, 0)
+        sb_l.setSpacing(10)
+        def _sb_lbl(text, color="#3d4458", url=None):
+            lbl = QLabel()
+            lbl.setStyleSheet(f"color: {color}; font-size: 11px; background: transparent;")
+            if url:
+                lbl.setOpenExternalLinks(True)
+                lbl.setText(f'<a href="{url}" style="color:{color};text-decoration:none;">{text}</a>')
+            else:
+                lbl.setText(text)
+            return lbl
 
-        # ───────────────────────────────────────────────
-        # ROOT LAYOUT
-        # ───────────────────────────────────────────────
+        sb_l.addWidget(_sb_lbl(f"ModSync Server  v{APP_VERSION}"))
+        sb_l.addWidget(_sb_lbl("  ·  ", "#2a2d3a"))
+        sb_l.addWidget(_sb_lbl("by SkyLett & AI", "#4a5060"))
+        sb_l.addWidget(_sb_lbl("  ·  ", "#2a2d3a"))
+        sb_l.addWidget(_sb_lbl("bar7dtd.ru", "#4a7060", "http://bar7dtd.ru"))
+        sb_l.addWidget(_sb_lbl("  ·  ", "#2a2d3a"))
+        sb_l.addWidget(_sb_lbl("Discord", "#504870", "https://discord.gg/B3zN2h7Ukf"))
+        sb_l.addWidget(_sb_lbl("  ·  ", "#2a2d3a"))
+        self._gh_status_lbl = _sb_lbl("GitHub: …", "#3d5060")
+        self._gh_check_result = None  # None | "uptodate" | ("update", tag) | "error"
+        sb_l.addWidget(self._gh_status_lbl)
+        self._update_banner = QPushButton()
+        self._update_banner.setObjectName("update_btn")
+        self._update_banner.setVisible(False)
+        self._update_banner.clicked.connect(self._on_update_click)
+        sb_l.addWidget(self._update_banner)
+        sb_l.addStretch(1)
+        _show_tips = bool(cfg.get("show_tooltips", True))
+        self._show_tooltips = _show_tips
+        self.tooltips_btn = QPushButton(
+            "Подсказки: ВКЛ" if _show_tips else "Подсказки: ВЫКЛ"
+        )
+        self.tooltips_btn.setObjectName("sb_btn")
+        self.tooltips_btn.setToolTip("Показывать/скрывать подсказки при наведении.")
+        self.tooltips_btn.clicked.connect(self._on_toggle_tooltips)
+        sb_l.addWidget(self.tooltips_btn)
+        self.lang_btn = QPushButton("EN")
+        self.lang_btn.setObjectName("sb_btn")
+        self.lang_btn.setFixedWidth(42)
+        self.lang_btn.setToolTip("Switch language / Сменить язык")
+        self.lang_btn.clicked.connect(self.on_toggle_lang)
+        sb_l.addWidget(self.lang_btn)
+
+        # ─── Tab card wrapper ───
+        tab_card = QFrame()
+        tab_card.setObjectName("glass_card")
+        tab_card_l = QVBoxLayout(tab_card)
+        tab_card_l.setContentsMargins(8, 8, 8, 8)
+        tab_card_l.setSpacing(0)
+        tab_card_l.addWidget(self.tabs)
+
+        # ─── Root layout ───
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setContentsMargins(12, 12, 12, 0)
         root.setSpacing(8)
-        root.addWidget(self.server_group)
-        root.addWidget(self.cache_group)
-        root.addWidget(self.auth_group)
-        root.addWidget(splitter, 1)
+        root.addWidget(card1)
+        root.addLayout(mid_row)
+        root.addWidget(tab_card, 1)
+        root.addWidget(sb_frame)
 
-        # логи старт
-        self.append_log(f"[APP] Config: {CONFIG_PATH}")
-        self.append_log(f"[APP] Cache:  {CACHE_DIR}")
-        self.append_log(f"[APP] DB:     {DB_PATH}")
-        self.append_log(f"[APP] Cache policy: max={cache_max_gb}GB keep_versions={keep_mod_versions} ttl_days={bundle_ttl_days}")
-        self.append_log(f"[APP] manifest_hash: {self.state.get_manifest().get('manifest_hash')}")
+        # ─── MS / UPnP / LAN beacon state ───
+        self._ms_client: modsync_v2.MasterClient | None = None
+        self._lan_beacon: modsync_v2.LANBeacon | None = None
+        self._lan_ip: str = ""
+        self._upnp_enabled = bool(cfg.get("upnp_enabled", False))
+        self._upnp_failed = False
+        self._upnp_port: int | None = None
+        if self._upnp_enabled:
+            self.upnp_btn.setChecked(True)
+            self.upnp_btn.setText("UPnP: …")
+            QTimer.singleShot(500, lambda: threading.Thread(
+                target=self._upnp_probe_bg, daemon=True).start()
+            )
 
+        # ─── Language ───
+        self._lang = cfg.get("lang", "ru")
+        self.retranslate_ui()
+
+        # ─── Init data ───
         self.update_watcher_paths()
-        self.refresh_cache_label()
-        self.cache_timer.start()
         self.clients_timer.start()
         self.refresh_clients_table()
         self.refresh_auth_label()
@@ -2482,22 +2490,61 @@ class ServerWindow(QWidget):
         self.refresh_mods_table()
         self.refresh_autostart_button()
 
+        self.append_log(f"[APP] Config: {CONFIG_PATH}")
+        self.append_log(f"[APP] DB:     {DB_PATH}")
+
+        self._gh_status_signal.connect(self._apply_gh_status)
+        self._status_lbl_signal.connect(self._apply_ext_ip)
+        threading.Thread(target=self._update_check_bg, daemon=True).start()
+
+        # ─── Restart watch ───
+        self._restart_watch_pid: int | None = None
+        self._restart_watch_timer: QTimer | None = None
+        if bool(cfg.get("restart_watch", False)):
+            QTimer.singleShot(1000, self._start_restart_watch)
+
         if bool(cfg.get("auto_start_server", True)):
             QTimer.singleShot(200, self.on_start)
 
-        enforce_cache_policy(cache_max_gb, keep_mod_versions, bundle_ttl_days, log_cb=self.append_log)
-        self.refresh_cache_label()
-
-    # ---- helpers для синхронизации ползунков ----
-    def _sync_slider_cache_max(self, text): pass
-    def _sync_slider_keep_versions(self, text): pass
-    def _sync_slider_bundle_ttl(self, text): pass
-
     # ---------------- logs ----------------
 
+    # Цвета по префиксу тега [TAG]
+    _LOG_COLORS = {
+        "APP":      "#8b949e",  # серый — системные
+        "AUTH":     "#cba6f7",  # фиолетовый
+        "UPnP":     "#89b4fa",  # синий
+        "AUTOSTART":"#89b4fa",
+        "PORT":     "#89b4fa",
+        "V2":       "#a6e3a1",  # зелёный — торрент/публикация
+        "TRACKER":  "#6a7494",  # тёмно-серый — шумный трекер
+        "MS":       "#89dceb",  # голубой — мастер-сервер
+        "SCAN":     "#f9e2af",  # жёлтый — сканирование
+        "WATCHER":  "#f9e2af",
+        "ERROR":    "#f38ba8",  # красный
+        "WARN":     "#fab387",  # оранжевый
+    }
+    _LOG_DEFAULT_COLOR = "#cdd6f4"
+
     def append_log(self, msg: str):
+        import html as _html
         ts = time.strftime("%H:%M:%S")
-        self.log_view.append(f"[{ts}] {msg}")
+
+        # Определяем цвет по тегу [TAG] в начале сообщения
+        color = self._LOG_DEFAULT_COLOR
+        import re as _re
+        m = _re.match(r"\[([A-Za-z0-9_\-]+)\]", msg)
+        if m:
+            tag = m.group(1).upper()
+            color = self._LOG_COLORS.get(tag, self._LOG_DEFAULT_COLOR)
+            # Ошибки и предупреждения в любом теге
+        if "error" in msg.lower() or "ошибка" in msg.lower() or "❌" in msg:
+            color = self._LOG_COLORS["ERROR"]
+        elif "warn" in msg.lower() or "⚠" in msg:
+            color = self._LOG_COLORS["WARN"]
+
+        ts_html = f'<span style="color:#4a5568">[{ts}]</span>'
+        msg_html = f'<span style="color:{color}">{_html.escape(msg)}</span>'
+        self.log_view.append(f'{ts_html} {msg_html}')
 
     # ---------------- watcher ----------------
 
@@ -2531,59 +2578,212 @@ class ServerWindow(QWidget):
 
     def on_fs_changed(self, _path: str):
         self.rescan_debounce.start(1500)
-
-    # ---------------- cache ----------------
-
-    def refresh_cache_label(self):
-        total, cnt = cache_stats()
-        max_gb = int(self.state.cache_cfg.get("cache_max_gb", DEFAULT_CACHE_MAX_GB))
-        max_bytes = max_gb * 1024 * 1024 * 1024
-        self.cache_lbl.setText(self.tr("lbl_cache_info", used=human_bytes(total), total=human_bytes(max_bytes), cnt=cnt))
-        pct = int(total * 100 / max_bytes) if max_bytes > 0 else 0
-        pct = min(pct, 100)
-        self.cache_bar.setValue(pct)
-        if pct >= 90:
-            self.cache_bar.setProperty("warningLevel", "crit")
-        elif pct >= 70:
-            self.cache_bar.setProperty("warningLevel", "warn")
-        else:
-            self.cache_bar.setProperty("warningLevel", "")
-        self.cache_bar.style().unpolish(self.cache_bar)
-        self.cache_bar.style().polish(self.cache_bar)
-
-    def on_purge_cache(self):
-        purge_cache(log_cb=self.append_log)
-        self.refresh_cache_label()
-
-    def on_apply_cache_settings(self):
-        try:
-            max_gb = int(self.cache_max_edit.text().strip())
-            keep_v = int(self.keep_versions_edit.text().strip())
-            ttl_d = int(self.bundle_ttl_edit.text().strip())
-        except Exception:
-            QMessageBox.warning(self, "Error", "Cache settings must be integers")
-            return
-
-        if max_gb < 1 or max_gb > 500:
-            QMessageBox.warning(self, "Error", "Cache max GB must be 1..500")
-            return
-        if keep_v < 1 or keep_v > 10:
-            QMessageBox.warning(self, "Error", "Keep mod versions must be 1..10")
-            return
-        if ttl_d < 0 or ttl_d > 365:
-            QMessageBox.warning(self, "Error", "Bundle TTL days must be 0..365 (0 = disable TTL)")
-            return
-
-        self.state.cache_cfg["cache_max_gb"] = max_gb
-        self.state.cache_cfg["keep_mod_versions"] = keep_v
-        self.state.cache_cfg["bundle_ttl_days"] = ttl_d
-
-        self.append_log(f"[CACHE] Apply policy: max={max_gb}GB keep_mod_versions={keep_v} bundle_ttl_days={ttl_d}")
-        enforce_cache_policy(max_gb, keep_v, ttl_d, log_cb=self.append_log)
-        self.refresh_cache_label()
-        self.save_config()
+        if self.state.v2 is not None:
+            self.state.v2.build.mark_dirty()
+            if self.auto_publish_chk.isChecked():
+                self._auto_pub_timer.start(5000)
+            else:
+                self.refresh_v2_status()
 
     # ---------------- scan async ----------------
+
+    # ---------------- V2: публикация ----------------
+
+    def trigger_publish(self):
+        """Публикация в рабочем потоке (кнопка / POST /api/v2/publish / автомат)."""
+        if self._publish_thread is not None and self._publish_thread.is_alive():
+            self.append_log("[V2] Публикация уже идёт")
+            return
+        mods_root = Path(self.mods_edit.text().strip() or DEFAULT_MODS_PATH)
+        try:
+            port = int(self.port_edit.text().strip())
+        except Exception:
+            port = None
+
+        self.publish_progress.setValue(0)
+        self.publish_progress.setVisible(True)
+        self.publish_btn.setEnabled(False)
+
+        def worker():
+            try:
+                cfg = read_config()
+                tracker_url = ""
+                tracker_url_local = ""
+                webseed_url = ""
+                ip = self._running_ip.split(":")[0] if self._running_ip else ""
+                lan_ip = self._lan_ip or ip
+                if port and ip:
+                    tracker_url = f"http://{ip}:{port}/announce"
+                    tracker_url_local = f"http://{lan_ip}:{port}/announce"
+                    webseed_url = f"http://{ip}:{port}/api/v2/ws/"
+                res = self.state.v2.build.publish(
+                    mods_root,
+                    server_name=cfg.get("server_name", ""),
+                    tracker_url=tracker_url,
+                    tracker_url_local=tracker_url_local,
+                    webseed_url=webseed_url,
+                    tracked_mods=set(self.state.tracked_mods) if self.state.tracked_mods else None,
+                    log_cb=lambda m: self.log_bridge.log_signal.emit(m),
+                    progress_cb=lambda idx, total: self.pub_progress_bridge.progress.emit(idx, total),
+                )
+                if self.state.v2.engine is not None:
+                    snap_root = self.state.v2.build.get_snapshot_save_root()
+                    if snap_root is not None:
+                        self.state.v2.engine.seed_from(
+                            self.state.v2.build.get_torrent(), snap_root)
+                self.log_bridge.log_signal.emit(f"[V2] Готово: {res['build_id']}")
+                if self._ms_client is not None:
+                    files = res.get("files") or []
+                    self._ms_client.upload_manifest(files)
+            except Exception as e:
+                self.log_bridge.log_signal.emit(f"[V2] Ошибка публикации: {e}")
+            finally:
+                self.pub_progress_bridge.done.emit()
+
+        self._publish_thread = threading.Thread(target=worker, daemon=True)
+        self._publish_thread.start()
+
+    def on_publish_clicked(self):
+        self.trigger_publish()
+
+    def _on_publish_progress(self, idx: int, total: int):
+        if total > 0:
+            self.publish_progress.setValue(int(idx * 100 / total))
+
+    def _on_publish_done(self):
+        self.publish_progress.setValue(100)
+        self.publish_progress.setVisible(False)
+        self.publish_btn.setEnabled(True)
+
+    # ── Master Server ─────────────────────────────────────────
+
+    def _ms_get_build_info(self):
+        s = self.state.v2.build.snapshot()
+        return (
+            s.get("build_id", ""),
+            s.get("infohash_v2", ""),
+            self.http_thread is not None,
+        )
+
+    def _ms_start(self):
+        if not self.ms_listing_chk.isChecked():
+            return
+        try:
+            port = int(self.port_edit.text().strip())
+        except Exception:
+            port = DEFAULT_PORT
+
+        self._ms_client = modsync_v2.MasterClient(
+            log_cb=lambda m: self.log_bridge.log_signal.emit(m)
+        )
+        self.ms_status_lbl.setText("Подключение…")
+        self.ms_status_lbl.setStyleSheet("color: #e8971f; font-size: 11px;")
+
+        def _do_start():
+            self._ms_client.start(
+                token=None,  # всегда свежая регистрация — сервер сам удалит дубль по host+port
+                get_server_name=lambda: self.server_name_edit.text().strip() or "ModSync Server",
+                port=port,
+                listing=True,
+                get_build_info=self._ms_get_build_info,
+                save_token_cb=self._ms_save_token,
+                whitelist_mode=self._is_whitelist_mode(),
+            )
+            registered = self._ms_client._token is not None
+            self.log_bridge.log_signal.emit(
+                "[MS] Зарегистрирован на мастер-сервере" if registered
+                else "[MS] Не удалось зарегистрироваться"
+            )
+            self.ms_status_lbl.setText(
+                f"● bar7dtd.ru (token …{self._ms_client._token[-6:]})" if registered else "● Ошибка регистрации"
+            )
+            self.ms_status_lbl.setStyleSheet(
+                "color: #3fb950; font-size: 11px;" if registered else "color: #f85149; font-size: 11px;"
+            )
+
+        threading.Thread(target=_do_start, daemon=True).start()
+
+    def _ms_save_token(self, token: str | None):
+        cfg = read_config()
+        if token:
+            cfg["ms_token"] = token
+        else:
+            cfg.pop("ms_token", None)
+        write_config(cfg)
+
+    def on_ms_listing_toggled(self, checked: bool):
+        if not checked:
+            reply = QMessageBox.question(
+                self,
+                "Отключить публичный листинг?",
+                "Ваш сервер будет исключён из публичного списка ModSync.\n"
+                "Клиентам придётся вводить адрес сервера вручную.\n\n"
+                "Выключить листинг?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                # Отмена — вернуть галочку обратно без рекурсии
+                self.ms_listing_chk.blockSignals(True)
+                self.ms_listing_chk.setChecked(True)
+                self.ms_listing_chk.blockSignals(False)
+                return
+
+        if not checked:
+            cfg = read_config()
+            cfg.pop("ms_token", None)
+            write_config(cfg)
+        self.save_config()
+        if checked and self.http_thread is not None:
+            self._ms_start()
+        elif not checked:
+            if self._ms_client is not None:
+                threading.Thread(
+                    target=self._ms_client.unregister, daemon=True
+                ).start()
+                self._ms_client.stop()
+                self._ms_client = None
+            self.ms_status_lbl.setText("")
+
+    def on_ms_help(self):
+        QMessageBox.information(
+            self, self.tr("dlg_ms_help_title"),
+            self.tr("dlg_ms_help_text"),
+        )
+
+    def refresh_v2_status(self):
+        if self.state.v2 is None:
+            return
+        s = self.state.v2.build.snapshot()
+        if s["publishing"]:
+            txt, color = self.tr("v2_publishing"), "#e8971f"
+        elif not s["has_published"]:
+            txt, color = self.tr("v2_not_published"), "#f85149"
+        elif s["draft_dirty"]:
+            txt, color = self.tr("v2_has_changes", build_id=s["build_id"]), "#e8971f"
+        else:
+            fc = s.get("file_count", 0)
+            txt, color = self.tr("v2_published", build_id=s["build_id"], fc=fc), "#3fb950"
+        self.v2_status_lbl.setText(txt)
+        self.v2_status_lbl.setStyleSheet(
+            f"color: {color}; font-weight: bold; font-size: 13px;")
+
+    def on_v2_tick(self):
+        if self.state.v2 is None:
+            return
+        self.refresh_v2_status()
+        eng = self.state.v2.engine
+        if eng is not None:
+            for msg in eng.pump_alerts():
+                self.append_log(msg)
+            st = eng.stats()
+            if st.get("active"):
+                up_mb = st["total_upload"] / (1024 * 1024)
+                rate_kb = st["upload_rate"] / 1024
+                self.v2_seed_lbl.setText(
+                    self.tr("lbl_seed_stats", peers=st["peers"], mb=up_mb, kb=rate_kb))
+            else:
+                self.v2_seed_lbl.setText("")
 
     def on_scan_async(self):
         mods_path = self.mods_edit.text().strip()
@@ -2754,14 +2954,16 @@ class ServerWindow(QWidget):
         self.save_config()
     # ---------------- server start/stop ----------------
 
-    def on_auto_port(self):
-        try:
-            preferred = int(self.port_edit.text().strip())
-        except Exception:
-            preferred = DEFAULT_PORT
-        chosen = pick_port("0.0.0.0", preferred)
-        self.port_edit.setText(str(chosen))
-        self.append_log(f"[PORT] Selected free port: {chosen}")
+    def on_auto_port(self, checked: bool):
+        self.port_edit.setEnabled(not checked)
+        if checked:
+            try:
+                preferred = int(self.port_edit.text().strip())
+            except Exception:
+                preferred = DEFAULT_PORT
+            chosen = pick_port("0.0.0.0", preferred)
+            self.port_edit.setText(str(chosen))
+            self.append_log(f"[PORT] Auto: selected free port {chosen}")
         self.refresh_autostart_button()
         self.save_config()
 
@@ -2777,7 +2979,39 @@ class ServerWindow(QWidget):
         folder = QFileDialog.getExistingDirectory(self, "Select Mods Folder", current)
         if folder:
             self.mods_edit.setText(folder)
+            # попробовать автоподхватить имя из serverconfig рядом
+            auto = read_server_name_from_config(folder)
+            if auto and not self.server_name_edit.text().strip():
+                self.server_name_edit.setText(auto)
+                self.server_name_edit.setToolTip(f"Прочитано из serverconfig.xml: {auto}")
             self.on_scan_async()
+
+    def on_select_serverconfig(self):
+        from PyQt6.QtWidgets import QFileDialog
+        current = str(Path(self.mods_edit.text().strip()).parent) if self.mods_edit.text().strip() else str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать serverconfig.xml", current, "XML files (*.xml)"
+        )
+        if not path:
+            return
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.parse(path).getroot()
+            for prop in root.iter("property"):
+                if prop.get("name") == "ServerName":
+                    val = (prop.get("value") or "").strip()
+                    if val:
+                        self.server_name_edit.setText(val)
+                        self.server_name_edit.setToolTip(f"Прочитано из: {path}")
+                        return
+            QMessageBox.warning(self, "serverconfig.xml", "Свойство ServerName не найдено в файле.")
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
+
+    def _on_server_name_changed(self, text: str):
+        cfg = read_config()
+        cfg["server_name"] = text.strip()
+        write_config(cfg)
 
 
 
@@ -2797,52 +3031,81 @@ class ServerWindow(QWidget):
         t = self.tr
         self.setWindowTitle(t("window_title"))
         self.lang_btn.setText(t("btn_lang"))
-        # Groups
-        self.server_group.setTitle(t("grp_server"))
-        self.cache_group.setTitle(t("grp_cache"))
-        self.auth_group.setTitle(t("grp_access"))
+        # Card titles
+        if self._card2_title_lbl:
+            self._card2_title_lbl.setText(t("grp_server").upper())
+        if self._card3_title_lbl:
+            self._card3_title_lbl.setText(t("grp_build").upper())
+        if self._card4_title_lbl:
+            self._card4_title_lbl.setText(t("grp_access").upper())
+        # Inline labels
+        self.lbl_sname_w.setText(t("lbl_server_name"))
+        self.lbl_auto_port_label.setText(t("lbl_auto_port_colon"))
+        self.lbl_listing_w.setText(t("lbl_listing") + ":")
+        self.ms_listing_wl_hint.setText(t("lbl_wl_hint_listing"))
+        self.lbl_auto_pub_label.setText(t("lbl_auto_publish") + ":")
+        self.lbl_restart_watch_w.setText(t("lbl_restart_watch") + ":")
+        self.restart_watch_chk.setToolTip(t("tip_restart_watch"))
+        self.lbl_log_title.setText(t("lbl_log_title"))
+        self.clear_log_btn.setText(t("btn_clear_log"))
         # Labels
         self.lbl_mods_path.setText(t("lbl_mods_path"))
         self.lbl_port.setText(t("lbl_port"))
-        self.lbl_mode.setText(t("lbl_mode"))
         self.lbl_auth_url_w.setText(t("lbl_auth_url"))
         self.lbl_auth_key_w.setText(t("lbl_auth_key"))
         self.auth_status_lbl.setText(t("lbl_auth_status"))
-        # Cache labels
-        self.lbl_cache_max.setText(t("lbl_cache_max"))
-        self.lbl_keep_ver.setText(t("lbl_keep_ver"))
-        self.lbl_ttl.setText(t("lbl_ttl"))
         self.lbl_clients.setText(t("lbl_clients"))
         self.lbl_whitelist.setText(t("lbl_whitelist"))
         self.lbl_blacklist.setText(t("lbl_blacklist"))
-        # Buttons
+        # Buttons + tooltips
         self.select_mods_btn.setText(t("btn_select"))
         self.select_mods_btn.setToolTip(t("btn_select_tip"))
-        self.auto_port_btn.setText(t("btn_auto_port"))
+        self.mods_edit.setToolTip(t("tip_mods_path"))
+        self.select_serverconfig_btn.setToolTip(t("tip_serverconfig"))
+        self.server_name_edit.setToolTip(t("tip_server_name"))
         self.start_btn.setText(t("btn_start"))
+        self.start_btn.setToolTip(t("tip_start"))
         self.stop_btn.setText(t("btn_stop"))
+        self.stop_btn.setToolTip(t("tip_stop"))
+        self.port_edit.setToolTip(t("tip_port"))
+        self.auto_port_btn.setToolTip(t("tip_auto_port"))
         self.autostart_btn.setText(t("btn_autostart_on") if self.autostart_btn.isChecked() else t("btn_autostart_off"))
-        self.apply_cache_btn.setText(t("btn_apply_cache"))
+        self.autostart_btn.setToolTip(t("tip_autostart"))
+        self.upnp_btn.setToolTip(t("btn_upnp_tip"))
         self.scan_btn.setText(t("btn_scan"))
-        self.purge_btn.setText(t("btn_purge"))
-        self.open_cache_btn.setText(t("btn_open_cache"))
-        self.open_cache_btn.setToolTip(t("btn_open_cache_tip"))
+        self.scan_btn.setToolTip(t("btn_scan_tip"))
+        self.publish_btn.setText(t("btn_publish"))
+        self.publish_btn.setToolTip(t("btn_publish_tip"))
+        self.auto_publish_chk.setToolTip(t("tip_auto_publish"))
+        self.ms_listing_chk.setToolTip(t("tip_listing"))
+        self.ms_help_btn.setToolTip(t("tip_ms_help"))
+        self.lbl_v2.setText(t("lbl_build"))
         self.auth_mode_open_btn.setText(t("btn_mode_open"))
+        self.auth_mode_open_btn.setToolTip(t("tip_mode_open"))
         self.auth_mode_wl_btn.setText(t("btn_mode_wl"))
+        self.auth_mode_wl_btn.setToolTip(t("tip_mode_wl"))
         self.instr_btn.setText(t("btn_instr"))
+        self.instr_btn.setToolTip(t("tip_instr"))
         self.sync_auth_btn.setText(t("btn_sync_auth"))
+        self.sync_auth_btn.setToolTip(t("tip_sync_auth"))
         self.copy_btn.setText(t("btn_copy_steamid"))
+        self.copy_btn.setToolTip(t("tip_copy_steamid"))
         self.ban_from_clients_btn.setText(t("btn_ban"))
         self.ban_from_clients_btn.setToolTip(t("btn_ban_tip"))
         self.copy_allowed_btn.setText(t("btn_copy_allowed"))
+        self.copy_allowed_btn.setToolTip(t("tip_copy_allowed"))
         self.mods_select_all_btn.setText(t("btn_mods_all"))
         self.mods_select_none_btn.setText(t("btn_mods_none"))
         self.mods_apply_btn.setText(t("btn_mods_apply"))
         self.bl_add_btn.setText(t("btn_ban"))
+        self.bl_add_btn.setToolTip(t("tip_bl_add"))
         self.bl_remove_btn.setText(t("btn_unban"))
+        self.bl_remove_btn.setToolTip(t("tip_bl_remove"))
+        self.tooltips_btn.setText(t("btn_tooltips_on") if self._show_tooltips else t("btn_tooltips_off"))
+        self.tooltips_btn.setToolTip(t("tip_tooltips"))
         # UPnP button (keep current state)
         if not self.upnp_btn.isEnabled():
-            pass  # failed state — tooltip already set with port info
+            pass  # failed state — tooltip already set
         elif self.upnp_btn.isChecked():
             self.upnp_btn.setText(t("btn_upnp_on"))
             self.upnp_btn.setToolTip(t("btn_upnp_tip"))
@@ -2854,9 +3117,10 @@ class ServerWindow(QWidget):
         self.tabs.setTabText(1, t("tab_whitelist"))
         self.tabs.setTabText(2, t("tab_blacklist"))
         self.tabs.setTabText(3, t("tab_mods"))
+        self.tabs.setTabText(4, t("tab_logs"))
         # Table headers
         self.clients_table.setHorizontalHeaderLabels([
-            t("th_steamid"), t("th_last_seen"), t("th_ip"), t("th_status"), t("th_sent")
+            t("th_steamid"), t("th_last_seen"), t("th_ip"), t("th_status"), t("th_build"), t("th_p2p")
         ])
         self.mods_table.setHorizontalHeaderLabels([
             t("th_mod_name"), t("th_files"), t("th_size")
@@ -2874,6 +3138,16 @@ class ServerWindow(QWidget):
             self.status_lbl.setToolTip(t("lbl_status_tip"))
         else:
             self.status_lbl.setText(t("lbl_status_stopped"))
+        # GitHub status label
+        result = getattr(self, "_gh_check_result", None)
+        if result is None:
+            self._gh_status_lbl.setText(t("gh_checking"))
+        elif result == "uptodate":
+            self._gh_status_lbl.setText(t("gh_uptodate"))
+        elif result == "error":
+            self._gh_status_lbl.setText("GitHub: ✗")
+        elif isinstance(result, tuple) and result[0] == "update":
+            self._gh_status_lbl.setText(t("gh_update", v=result[1]))
         # Auth mode hint
         if self.auth_mode_open_btn.isChecked():
             self.auth_mode_hint.setText(t("lbl_auth_hint_open"))
@@ -2882,14 +3156,119 @@ class ServerWindow(QWidget):
         # Mods summary refresh
         self.refresh_mods_table()
 
+    # ─── Tooltips toggle ─────────────────────────────────────────
+
+    def _on_toggle_tooltips(self):
+        self._show_tooltips = not self._show_tooltips
+        t = self.tr
+        self.tooltips_btn.setText(t("btn_tooltips_on") if self._show_tooltips else t("btn_tooltips_off"))
+        if self._show_tooltips:
+            self.setStyleSheet(GLASS_STYLE)
+        else:
+            self.setStyleSheet(GLASS_STYLE + "\nQToolTip { opacity: 0; max-height: 0; padding: 0; border: none; }")
+        self.save_config()
+
+    # ─── Auto-update check ───────────────────────────────────────
+
+    def _apply_gh_status(self, text: str, color: str):
+        self._gh_status_lbl.setText(text)
+        weight = "font-weight: 600; " if color == "#f59e0b" else ""
+        self._gh_status_lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; background: transparent; {weight}")
+
+    def _update_check_bg(self):
+        def _ver(s):
+            try:
+                return tuple(int(x) for x in s.split("."))
+            except Exception:
+                return (0,)
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": f"ModSync/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read())
+            tag = data.get("tag_name", "").lstrip("vV")
+            if not tag:
+                self._gh_check_result = "uptodate"
+                self._gh_status_signal.emit(self.tr("gh_uptodate"), "#4ade80")
+                return
+            if _ver(tag) > _ver(APP_VERSION):
+                html_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases/latest")
+                self._pending_update = (tag, html_url)
+                self._gh_check_result = ("update", tag)
+                self._gh_status_signal.emit(self.tr("gh_update", v=tag), "#f59e0b")
+                QTimer.singleShot(0, self, lambda: self._show_update_banner(tag, html_url))
+            else:
+                self._gh_check_result = "uptodate"
+                self._gh_status_signal.emit(self.tr("gh_uptodate"), "#4ade80")
+        except Exception as e:
+            self._gh_check_result = "error"
+            self.append_log(f"[APP] GitHub check failed: {e}")
+            self._gh_status_signal.emit("GitHub: ✗", "#6c7086")
+
+    def _apply_ext_ip(self, ext_running: str):
+        self._running_ip = ext_running
+        self.status_lbl.setText(self.tr("lbl_status_running", ip=ext_running))
+
+    def _fetch_external_ip_bg(self, port: int):
+        try:
+            req = urllib.request.Request(
+                "https://api.ipify.org", headers={"User-Agent": f"ModSync/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                ext_ip = resp.read().decode().strip()
+            if not ext_ip:
+                return
+            ext_running = f"{ext_ip}:{port}"
+            t_port = port + 1
+            self.append_log(self.tr("log_ext_ip", ip=ext_ip))
+            self._status_lbl_signal.emit(ext_running)
+        except Exception as e:
+            self.append_log(f"[APP] External IP fetch failed: {e}")
+
+    def _show_update_banner(self, version: str, url: str):
+        self._update_banner.setText(self.tr("lbl_update", v=version) + "  " + self.tr("btn_download_update"))
+        self._update_banner.setVisible(True)
+        self._update_url = url
+
+    def _on_update_click(self):
+        url = getattr(self, "_update_url", f"https://github.com/{GITHUB_REPO}/releases/latest")
+        webbrowser.open(url)
+
     def on_toggle_upnp(self):
         self._upnp_enabled = self.upnp_btn.isChecked()
+        self._upnp_failed = False
+        self.upnp_btn.setEnabled(True)
         if self._upnp_enabled:
-            self.upnp_btn.setText(self.tr("btn_upnp_on"))
+            self.upnp_btn.setText("UPnP: …")
+            self.upnp_btn.setToolTip(self.tr("btn_upnp_tip"))
             self.append_log(self.tr("upnp_enabled_log"))
+            self.save_config()
+            threading.Thread(target=self._upnp_probe_bg, daemon=True).start()
         else:
             self.upnp_btn.setText(self.tr("btn_upnp_off"))
+            self.upnp_btn.setToolTip(self.tr("btn_upnp_tip"))
             self.append_log(self.tr("upnp_disabled_log"))
+            self.save_config()
+
+    def _upnp_probe_bg(self):
+        """Фоновая проверка UPnP-доступности без открытия порта."""
+        ok, result = upnp_probe()
+        if ok:
+            self.log_bridge.log_signal.emit(f"[UPnP] ✅ Роутер найден, внешний IP: {result} — порт будет пробит при старте сервера")
+            self.upnp_btn.setText(f"UPnP: {result}")
+            self.upnp_btn.setToolTip(f"UPnP работает. Внешний IP: {result}\nПорт будет открыт при следующем старте сервера.")
+        else:
+            self.log_bridge.log_signal.emit(f"[UPnP] ⚠ {result}")
+            self.upnp_btn.setText("UPnP: ERR")
+            self.upnp_btn.setToolTip(
+                f"{result}\n\nОткройте порт вручную в настройках роутера:\n"
+                f"  Протокол: TCP\n"
+                f"  Внешний порт: {self.port_edit.text().strip() or '8765'}\n"
+                f"  Внутренний IP: (этот компьютер)\n"
+                f"  Внутренний порт: {self.port_edit.text().strip() or '8765'}"
+            )
+            self._upnp_failed = True
+            self.save_config()
 
     def _do_upnp_open(self, port: int):
         """Запускает UPnP в фоне, результат логирует в GUI."""
@@ -2902,15 +3281,22 @@ class ServerWindow(QWidget):
                 self.log_bridge.log_signal.emit(self.tr("upnp_ok", port=port, ip=result))
                 self.log_bridge.log_signal.emit(self.tr("upnp_players", ip=result, port=port))
                 self.upnp_btn.setEnabled(True)
-                self.upnp_btn.setText(f"🌐  {result}")
+                self.upnp_btn.setText(f"UPnP: {result}")
                 self.upnp_btn.setToolTip(self.tr("btn_upnp_ok_tip", ip=result, port=port))
+                # Обновляем статус-метку с реальным внешним IP
+                ext_running = f"{result}:{port}"
+                self._running_ip = ext_running
+                self.status_lbl.setText(self.tr("lbl_status_running", ip=ext_running))
+                self.status_lbl.setToolTip(
+                    self.tr("lbl_status_tip") + f"\nHTTP: {port}  |  P2P: {port + 1}"
+                )
             else:
                 self._upnp_port = None
                 self._upnp_failed = True
                 self.save_config()
                 self.log_bridge.log_signal.emit(self.tr("upnp_fail", reason=result))
                 self.log_bridge.log_signal.emit(self.tr("upnp_manual", port=port))
-                self.upnp_btn.setText("🌐  UPnP: FAILED")
+                self.upnp_btn.setText(self.tr("btn_upnp_failed"))
                 self.upnp_btn.setEnabled(False)
                 self.upnp_btn.setToolTip(
                     self.tr("btn_upnp_fail_tip", port=port, ip=self._running_ip.split(":")[0])
@@ -2952,18 +3338,53 @@ class ServerWindow(QWidget):
             real_ip = socket.gethostbyname(socket.gethostname())
         except Exception:
             real_ip = "127.0.0.1"
+        self._lan_ip = real_ip
+        t_port = port + 1
         self._running_ip = f"{real_ip}:{port}"
         self.status_lbl.setText(self.tr("lbl_status_running", ip=self._running_ip))
-        self.status_lbl.setStyleSheet(
-            "color: #3fb950; font-weight: bold; font-size: 13px; "
-            "text-decoration: underline;"
+        self.status_lbl.setObjectName("status_ok")
+        self.status_lbl.setStyleSheet("color: #4ade80; font-weight: 600; font-size: 13px;")
+        self.status_lbl.setToolTip(
+            self.tr("lbl_status_tip") + self.tr("lbl_status_tip_ports", http=port, p2p=t_port)
         )
-        self.status_lbl.setToolTip(self.tr("lbl_status_tip"))
-        self.append_log(f"[APP] Server started on {self._running_ip}")
+        self.append_log(f"[APP] Server started on {self._running_ip} (torrent port: {t_port})")
+
+        # LAN beacon — рассылаем LAN IP на широковещательный UDP
+        lan_ip_local = self._running_ip.split(":")[0] if self._running_ip else ""
+        if lan_ip_local:
+            if getattr(self, "_lan_beacon", None):
+                self._lan_beacon.stop()
+            self._lan_beacon = modsync_v2.LANBeacon(lan_ip_local, port)
+            self._lan_beacon.start()
+
+        # Показать внешний IP в статусе (в фоне)
+        threading.Thread(target=self._fetch_external_ip_bg, args=(port,), daemon=True).start()
 
         # UPnP проброс порта
         if self._upnp_enabled and not getattr(self, "_upnp_failed", False):
             self._do_upnp_open(port)
+
+        # V2: торрент-движок на порту HTTP+1 (t_port уже задан выше)
+        try:
+            eng = self.state.v2.ensure_engine(
+                t_port, log_cb=lambda m: self.log_bridge.log_signal.emit(m))
+            tor = self.state.v2.build.get_torrent()
+            snap_root = self.state.v2.build.get_snapshot_save_root()
+            if tor is not None and snap_root is not None:
+                eng.seed_from(tor, snap_root)
+            else:
+                self.append_log("[V2] Нет опубликованной сборки — нажми «Опубликовать»")
+            if self._upnp_enabled and not getattr(self, "_upnp_failed", False):
+                self._do_upnp_open(t_port)
+        except Exception as e:
+            self.append_log(f"[V2] Движок не запустился: {e}")
+
+        # Master Server
+        self._ms_start()
+
+        # Auto-publish при старте если включена галочка
+        if self.auto_publish_chk.isChecked():
+            QTimer.singleShot(3000, self.trigger_publish)
 
         self.save_config()
 
@@ -2972,17 +3393,29 @@ class ServerWindow(QWidget):
             return
         self.http_thread.stop()
         self.http_thread = None
+        if self._lan_beacon is not None:
+            self._lan_beacon.stop()
+            self._lan_beacon = None
+        if self.state.v2 is not None and self.state.v2.engine is not None:
+            self.state.v2.engine.stop()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.port_edit.setEnabled(True)
+        self.port_edit.setEnabled(not self.auto_port_btn.isChecked())
         self.auto_port_btn.setEnabled(True)
         self.autostart_btn.setEnabled(True)
         self.status_light.set_state("stopped")
         self._running_ip = ""
         self.status_lbl.setText(self.tr("lbl_status_stopped"))
-        self.status_lbl.setStyleSheet("color: #f85149; font-weight: bold; font-size: 13px;")
+        self.status_lbl.setObjectName("status_stop")
+        self.status_lbl.setStyleSheet("color: #f87171; font-weight: 600; font-size: 13px;")
         self.status_lbl.setToolTip("")
         self.append_log("[APP] Server stopped.")
+
+        # Master Server
+        if self._ms_client is not None:
+            self._ms_client.stop()
+            self._ms_client = None
+        self.ms_status_lbl.setText("")
 
         # Убрать UPnP маппинг
         if self._upnp_port is not None:
@@ -3059,43 +3492,57 @@ class ServerWindow(QWidget):
 
     def refresh_clients_table(self):
         items = db_list_clients(limit=500)
+        cur_build = ""
+        if self.state.v2 is not None:
+            s = self.state.v2.build.snapshot()
+            cur_build = s.get("build_id", "")
 
         self.clients_table.setRowCount(len(items))
         for row, it in enumerate(items):
             steamid = it.get("steamid", "")
             last_seen = int(it.get("last_seen", 0) or 0)
             ip = it.get("last_ip", "")
-            db_status = it.get("status", "UNKNOWN")
-            client_mh = it.get("last_client_manifest_hash", "")
-            sent = int(it.get("bytes_sent_total", 0) or 0)
+            client_build = it.get("build_id", "")
+            torrent_build = it.get("torrent_build_id", "")
 
-            # Пересчитываем статус на лету: сравниваем хэш клиента с текущим манифестом сервера
-            cur_server_hash = self.state.get_manifest().get("manifest_hash", "")
-            if client_mh and cur_server_hash and client_mh == cur_server_hash:
-                status = "OK"
-            elif not client_mh:
-                status = db_status  # ещё не подключался — оставляем то что в БД
+            # Статус: клиент забрал manifest текущего build → OK (ничего не качает)
+            #         клиент забрал torrent текущего build → Syncing (скачивает)
+            #         иначе → OUTDATED
+            if not client_build and not torrent_build:
+                status, status_color = "—", "#8b9ebe"
+            elif cur_build and torrent_build == cur_build:
+                status, status_color = "Syncing", "#e8a020"
+            elif cur_build and client_build == cur_build:
+                status, status_color = "OK", "#3fb950"
             else:
-                status = "OUTDATED"
+                status, status_color = "OUTDATED", "#f0a020"
 
-            last_seen_str = "-" if last_seen <= 0 else time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_seen))
-            sent_str = human_bytes(sent)
+            last_seen_str = "—" if last_seen <= 0 else time.strftime("%Y-%m-%d %H:%M", time.localtime(last_seen))
 
             sid_item = QTableWidgetItem(steamid)
             sid_item.setForeground(QColor("#89b4fa"))
-            sid_item.setToolTip(f"Click to open Steam profile: {steamid}")
+            sid_item.setToolTip("Двойной клик — открыть профиль Steam")
             self.clients_table.setItem(row, 0, sid_item)
             self.clients_table.setItem(row, 1, QTableWidgetItem(last_seen_str))
             self.clients_table.setItem(row, 2, QTableWidgetItem(ip))
             status_item = QTableWidgetItem(status)
-            if status == "OK":
-                status_item.setForeground(QColor("#3fb950"))
-            elif status == "OUTDATED":
-                status_item.setForeground(QColor("#f0a020"))
-            else:
-                status_item.setForeground(QColor("#8b9ebe"))
+            status_item.setForeground(QColor(status_color))
             self.clients_table.setItem(row, 3, status_item)
-            self.clients_table.setItem(row, 4, QTableWidgetItem(sent_str))
+            build_item = QTableWidgetItem(client_build[:8] if client_build else "—")
+            build_item.setForeground(QColor("#89b4fa" if client_build == cur_build else "#6a7494"))
+            self.clients_table.setItem(row, 4, build_item)
+
+            p2p_val = it.get("p2p_enabled", -1)
+            if p2p_val == 1:
+                p2p_text, p2p_color = "ВКЛ", "#4ade80"
+            elif p2p_val == 0:
+                p2p_text, p2p_color = "ВЫКЛ", "#f87171"
+            else:
+                p2p_text, p2p_color = "—", "#4a5060"
+            p2p_item = QTableWidgetItem(p2p_text)
+            p2p_item.setForeground(QColor(p2p_color))
+            p2p_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.clients_table.setItem(row, 5, p2p_item)
 
     def refresh_allowed_table(self):
         steamids = db_list_allowed_steamids(limit=5000)
@@ -3187,18 +3634,36 @@ class ServerWindow(QWidget):
         self._apply_auth_mode_ui(mode)
         self.save_config()
         self.append_log(f"[AUTH] Mode set to: {mode.upper()}")
+        # Сообщить мастер-серверу об изменении режима немедленно
+        if self._ms_client is not None:
+            self._ms_client.set_whitelist_mode(mode == "whitelist")
 
     def _apply_auth_mode_ui(self, mode: str):
         is_wl = (mode == "whitelist")
-        # Показываем/прячем строки URL и Key целиком
+        # Показываем/прячем весь блок конфига вайтлиста
+        if hasattr(self, "_wl_config_frame"):
+            self._wl_config_frame.setVisible(is_wl)
+        # Compat: индивидуальные виджеты
         for w in (self._auth_url_row_widgets + self._auth_key_row_widgets):
             w.setVisible(is_wl)
         if is_wl:
-            self.auth_mode_hint.setText("Only SteamIDs from your site are allowed")
-            self.auth_mode_hint.setStyleSheet("color: #fab387; font-size: 11px;")
+            self.auth_mode_hint.setText("Разрешены только SteamID из вашего вайтлиста")
+            self.auth_mode_hint.setStyleSheet("color: #f9a870; font-size: 11px;")
         else:
-            self.auth_mode_hint.setText("Everyone with a SteamID can connect")
-            self.auth_mode_hint.setStyleSheet("color: #a6e3a1; font-size: 11px;")
+            self.auth_mode_hint.setText("Разрешён любой игрок со Steam-аккаунтом")
+            self.auth_mode_hint.setStyleSheet("color: #4ade80; font-size: 11px;")
+        self._update_ms_listing_state()
+
+    def _update_ms_listing_state(self):
+        """Show info hint in whitelist mode; listing itself remains available."""
+        hint = getattr(self, "ms_listing_wl_hint", None)
+        if hint is None:
+            return
+        is_wl = getattr(self, "auth_mode_wl_btn", None) and self.auth_mode_wl_btn.isChecked()
+        hint.setVisible(bool(is_wl))
+
+    def _is_whitelist_mode(self) -> bool:
+        return getattr(self, "auth_mode_wl_btn", None) and self.auth_mode_wl_btn.isChecked()
 
     def on_show_whitelist_instructions(self):
         html = """<!DOCTYPE html>
@@ -3378,11 +3843,9 @@ The list refreshes automatically every N hours (configurable).</p>
 
     def save_config(self):
         cfg = {
+            "auto_publish": self.auto_publish_chk.isChecked(),
             "mods_path": self.mods_edit.text().strip(),
             "port": int(self.port_edit.text().strip()) if self.port_edit.text().strip().isdigit() else DEFAULT_PORT,
-            "cache_max_gb": int(self.state.cache_cfg.get("cache_max_gb", DEFAULT_CACHE_MAX_GB)),
-            "keep_mod_versions": int(self.state.cache_cfg.get("keep_mod_versions", DEFAULT_KEEP_MOD_VERSIONS)),
-            "bundle_ttl_days": int(self.state.cache_cfg.get("bundle_ttl_days", DEFAULT_BUNDLE_TTL_DAYS)),
             "tracked_mods": sorted(list(self.state.tracked_mods), key=lambda x: x.lower()),
             "auto_start_server": True,
             "auth_url": self.state.cache_cfg.get("auth", {}).get("auth_url", ""),
@@ -3393,10 +3856,94 @@ The list refreshes automatically every N hours (configurable).</p>
             "upnp_enabled": self._upnp_enabled,
             "upnp_failed": getattr(self, "_upnp_failed", False),
             "lang": self._lang,
+            "ms_listing": self.ms_listing_chk.isChecked(),
+            "auto_port": self.auto_port_btn.isChecked(),
+            "show_tooltips": getattr(self, "_show_tooltips", True),
+            "server_name": self.server_name_edit.text().strip(),
+            "restart_watch": self.restart_watch_chk.isChecked(),
         }
         write_config(cfg)
 
+    # ── Restart watch ──────────────────────────────────────────
+
+    @staticmethod
+    def _get_7dtd_pid() -> int | None:
+        """Возвращает PID 7DaysToDieServer.exe или None если не запущен."""
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq 7DaysToDieServer.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            for line in result.stdout.strip().splitlines():
+                parts = line.strip('"').split('","')
+                if len(parts) >= 2:
+                    try:
+                        return int(parts[1])
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        return None
+
+    def _start_restart_watch(self):
+        if self._restart_watch_timer is not None:
+            return
+        self._restart_watch_pid = self._get_7dtd_pid()
+        self._restart_watch_timer = QTimer(self)
+        self._restart_watch_timer.setInterval(30_000)
+        self._restart_watch_timer.timeout.connect(self._check_server_restart)
+        self._restart_watch_timer.start()
+
+    def _stop_restart_watch(self):
+        if self._restart_watch_timer is not None:
+            self._restart_watch_timer.stop()
+            self._restart_watch_timer = None
+        self._restart_watch_pid = None
+
+    def _check_server_restart(self):
+        new_pid = self._get_7dtd_pid()
+        old_pid = self._restart_watch_pid
+        if new_pid is None:
+            self._restart_watch_pid = None
+            return
+        if old_pid is None:
+            # Сервер только что обнаружен — запоминаем PID, не публикуем
+            self._restart_watch_pid = new_pid
+            return
+        if new_pid != old_pid:
+            self._restart_watch_pid = new_pid
+            self.log_bridge.log_signal.emit(self.tr("log_rw_restarted", pid=new_pid))
+            QTimer.singleShot(10_000, self._on_restart_republish)
+
+    def _on_restart_republish(self):
+        self.append_log(self.tr("log_rw_republish"))
+        self.trigger_publish()
+
+    def _on_restart_watch_toggled(self, on: bool):
+        self.append_log(self.tr("log_rw_on" if on else "log_rw_off"))
+        self.save_config()
+        if on:
+            self._start_restart_watch()
+        else:
+            self._stop_restart_watch()
+
     def closeEvent(self, event):
+        if self.http_thread is not None:
+            reply = QMessageBox.question(
+                self,
+                self.tr("dlg_close_title"),
+                self.tr("dlg_close_text"),
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Ok:
+                event.ignore()
+                return
+        self._stop_restart_watch()
+        # Уведомить мастер-сервер об уходе в оффлайн синхронно перед закрытием
+        if self._ms_client is not None:
+            self._ms_client.send_offline()
         try:
             self.on_stop()
         except Exception:
