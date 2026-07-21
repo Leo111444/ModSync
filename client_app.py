@@ -2764,7 +2764,34 @@ class ClientWindow(QWidget):
         if self.v2_engine is not None:
             self.v2_engine.set_share(share)
         self.append_log(f"[V2] Раздача: {'вкл' if share else 'выкл'}")
+        if share and self.v2_engine is None:
+            self._try_start_seed_engine()
         self._send_heartbeat()
+
+    def _try_start_seed_engine(self):
+        """Запускает движок раздачи сразу если моды актуальны (без нажатия Обновить)."""
+        b = self.cfg.get("server_url", "").strip().rstrip("/")
+        mods_dir = self.cfg.get("mods_dir", "").strip()
+        if not b or not mods_dir:
+            return
+        def worker():
+            try:
+                torrent_bytes = modsync_v2.fetch_bytes(b + "/api/v2/torrent")
+                def _start(tb=torrent_bytes, base_url=b, md=mods_dir):
+                    try:
+                        if self.v2_engine is None:
+                            self.v2_engine = modsync_v2.ClientEngine(
+                                listen_port=0,
+                                log_cb=lambda m: self.bridge.log.emit(m))
+                        self.v2_engine.update(tb, Path(md), base_url, share=True)
+                        self.bridge.log.emit("[V2] P2P раздача запущена")
+                        self._v2_poll_timer.start()
+                    except Exception as e:
+                        self.bridge.log.emit(f"[V2] ошибка старта раздачи: {e}")
+                QTimer.singleShot(0, _start)
+            except Exception as e:
+                self.bridge.log.emit(f"[V2] не удалось получить торрент: {e}")
+        threading.Thread(target=worker, daemon=True).start()
 
     def _send_heartbeat(self):
         base = self.cfg.get("server_url", "").strip().rstrip("/")

@@ -608,13 +608,23 @@ class Tracker:
             except Exception:
                 continue
 
-        return bencode({
+        try:
+            external_ip = bytes(int(x) for x in ip.split("."))
+            if len(external_ip) != 4:
+                external_ip = b""
+        except Exception:
+            external_ip = b""
+
+        resp: dict = {
             "interval": ANNOUNCE_INTERVAL,
             "min interval": 60,
             "complete": complete,
             "incomplete": incomplete,
             "peers": compact,
-        })
+        }
+        if external_ip:
+            resp["external ip"] = external_ip
+        return bencode(resp)
 
     @staticmethod
     def failure(reason: str) -> bytes:
@@ -1063,6 +1073,8 @@ class ClientEngine:
                 if "skipping tracker announce" in msg:
                     continue
                 out.append(f"[V2][lt] {msg}")
+            elif "external" in msg.lower() and "ip" in msg.lower():
+                out.append(f"[V2][IP] {msg}")
         return out
 
     def stop(self) -> None:
