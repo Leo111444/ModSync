@@ -553,7 +553,11 @@ class TorrentEngine:
         out = []
         for a in self.session.pop_alerts():
             if a.category() & lt.alert.category_t.error_notification:
-                out.append(f"[V2][lt] {a.message()}")
+                msg = a.message()
+                # loopback can't reach LAN tracker — expected noise, not an error
+                if "skipping tracker announce" in msg:
+                    continue
+                out.append(f"[V2][lt] {msg}")
         return out
 
     def stop(self) -> None:
@@ -892,9 +896,9 @@ class ClientEngine:
         self.session = lt.session({
             "listen_interfaces": f"0.0.0.0:{actual_port}",
             "enable_dht": False,
-            "enable_lsd": False,
-            "enable_upnp": False,
-            "enable_natpmp": False,
+            "enable_lsd": True,
+            "enable_upnp": True,
+            "enable_natpmp": True,
             "alert_mask": lt.alert.category_t.error_notification
                         | lt.alert.category_t.status_notification,
         })
@@ -1051,7 +1055,10 @@ class ClientEngine:
         out = []
         for a in self.session.pop_alerts():
             if a.category() & lt.alert.category_t.error_notification:
-                out.append(f"[V2][lt] {a.message()}")
+                msg = a.message()
+                if "skipping tracker announce" in msg:
+                    continue
+                out.append(f"[V2][lt] {msg}")
         return out
 
     def stop(self) -> None:
