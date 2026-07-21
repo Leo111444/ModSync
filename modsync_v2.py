@@ -624,7 +624,14 @@ class Tracker:
         }
         if external_ip:
             resp["external ip"] = external_ip
+
         return bencode(resp)
+
+    def get_swarm(self, info_hash: bytes) -> list[tuple[str, int, int]]:
+        """Возвращает [(ip, port, left), ...] для диагностики."""
+        with self.lock:
+            swarm = self.swarms.get(info_hash, {})
+            return [(v[0], v[1], v[3]) for v in swarm.values()]
 
     @staticmethod
     def failure(reason: str) -> bytes:
@@ -694,6 +701,11 @@ def handle_v2_get(handler, parsed, v2: V2State, mods_root: Path,
         else:
             ip = handler._get_client_ip()
             body = v2.tracker.announce(info_hash, peer_id, ip, port, left, event)
+            swarm = v2.tracker.get_swarm(info_hash)
+            if swarm:
+                peer_list = " | ".join(f"{sip}:{sp}({'S' if sl==0 else 'D'})"
+                                       for sip, sp, sl in swarm)
+                handler.log_message("[SWARM] %s", peer_list)
 
         handler.send_response(200)
         handler.send_header("Content-Type", "text/plain")
@@ -911,7 +923,8 @@ class ClientEngine:
             "enable_natpmp": True,
             "alert_mask": lt.alert.category_t.error_notification
                         | lt.alert.category_t.status_notification
-                        | lt.alert.category_t.port_mapping_notification,
+                        | lt.alert.category_t.port_mapping_notification
+                        | lt.alert.category_t.tracker_notification,
         })
         self.handle: "lt.torrent_handle | None" = None
         self._lock = threading.Lock()
@@ -1069,9 +1082,11 @@ class ClientEngine:
             msg = a.message()
             if cat & lt.alert.category_t.port_mapping_notification:
                 out.append(f"[V2][UPnP] {msg}")
-            elif cat & lt.alert.category_t.error_notification:
+            elif cat & lt.alert.category_t.tracker_notification:
                 if "skipping tracker announce" in msg:
                     continue
+                out.append(f"[V2][TR] {msg}")
+            elif cat & lt.alert.category_t.error_notification:
                 out.append(f"[V2][lt] {msg}")
             elif "external" in msg.lower() and "ip" in msg.lower():
                 out.append(f"[V2][IP] {msg}")
