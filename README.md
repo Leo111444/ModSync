@@ -4,6 +4,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
 ![PyQt6](https://img.shields.io/badge/GUI-PyQt6-green?logo=qt&logoColor=white)
+![libtorrent](https://img.shields.io/badge/P2P-libtorrent-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 ![Game](https://img.shields.io/badge/Game-7%20Days%20to%20Die-red)
 
@@ -18,61 +19,61 @@ Host your modpack — your players always get the right files automatically.
 
 ## Overview
 
-ModSync is a lightweight client-server application that keeps mod files in sync between a server host and players. The server host runs `server_app.py`, points it at the mods folder, and shares the address. Players run `client_app.py`, enter the address, and their mods are automatically updated to match the server.
+ModSync is a client-server application that keeps mod files in sync between a server host and players. The host runs `server_app.py`, points it at the Mods folder, and shares the address. Players run `client_app.py`, enter the address, and their mods are automatically updated.
 
-No more "wrong mod version" errors. No more manually sending zip files to friends.
+**v2** distributes files over BitTorrent — players seed to each other while downloading, so the host's bandwidth is not the bottleneck. An embedded tracker and a fallback HTTP protocol run on the same port simultaneously.
 
 ---
 
 ## Features
 
-- **Automatic sync** — clients download only what changed (file diffing via manifest)
-- **Steam ID whitelist** — control who can connect and download mods
-- **Cache management** — configurable cache size, version retention, and TTL
+- **P2P distribution** — BitTorrent sync via embedded libtorrent tracker; players seed to each other
+- **Automatic sync** — client downloads only what changed, verified by per-file hash manifest
+- **UPnP / NAT-PMP** — automatic port forwarding for inbound P2P connections
+- **Steam ID whitelist** — control who can connect; supports external auth URL
 - **Live file watching** — server detects new/changed mods automatically, no restart needed
-- **Dark GUI** — built with PyQt6, status indicators, client table, sliders for cache settings
-- **Auth integration** — optional external auth URL for Steam ID validation
+- **Auto-publish on server restart** — detects 7DaysToDieServer.exe restart and re-publishes
+- **Dark glassmorphism UI** — PyQt6 with EN/RU localisation
+- **Dual protocol** — v2 BitTorrent + v1 HTTP fallback on the same port
 
 ---
 
 ## Downloads
 
-**Don't want to install Python?** Grab the pre-built executables from the [Releases](https://github.com/Leo111444/ModSync/releases) page — no installation required, just run and go.
+Pre-built Windows executables (no Python required) on the [Releases](https://github.com/Leo111444/ModSync/releases) page.
+
+Download and extract the zip — keep the `_internal` folder next to the `.exe`.
 
 ---
 
-## Requirements
+## Requirements (running from source)
 
-- Python 3.10 or newer
+- Python 3.10+
 - PyQt6
-
-Install dependencies:
+- libtorrent (Python bindings)
 
 ```bash
-pip install PyQt6
+pip install -r requirements.txt
 ```
 
 ---
 
-## Building an Executable
+## Running from source
 
-If you want to build a standalone `.exe` yourself:
+```bash
+python server_app.py   # server GUI
+python client_app.py   # client GUI
+```
+
+---
+
+## Building executables
 
 ```bash
 pip install pyinstaller
-```
-
-**Server:**
-```bash
 pyinstaller --onefile --windowed --name ModSync-Server server_app.py
-```
-
-**Client:**
-```bash
 pyinstaller --onefile --windowed --name ModSync-Client client_app.py
 ```
-
-The output will be in the `dist/` folder. The `--windowed` flag hides the console window since both apps have a GUI.
 
 ---
 
@@ -80,78 +81,61 @@ The output will be in the `dist/` folder. The `--windowed` flag hides the consol
 
 ### Server (host)
 
-```bash
-python server_app.py
-```
-
-1. Set the path to your `Mods` folder
-2. Set the port (default is fine for LAN, open it in your router for internet play)
-3. Add allowed Steam IDs to the whitelist
-4. Click **Start**
-5. Share your IP and port with players
+1. Point to your `Mods` folder
+2. Set port (default 8766; open it in your router or let UPnP handle it)
+3. Add player Steam IDs to the whitelist (or switch to Open mode)
+4. Click **Publish** — server builds a torrent snapshot and starts seeding
+5. Share your external IP and port with players
 
 ### Client (players)
 
-```bash
-python client_app.py
-```
-
 1. Enter the server address (`ip:port`)
 2. Enter your Steam ID
-3. Click **Sync** — missing or outdated mods are downloaded automatically
+3. Click **Check** — missing or outdated mods download automatically via P2P
+4. Enable **P2P sharing** to seed to other players while they download
 
 ---
 
-## Configuration
-
-Settings are saved automatically via the GUI. Key options:
-
-| Setting | Description |
-|---|---|
-| `mods_path` | Path to the folder containing your mods |
-| `port` | HTTP port the server listens on |
-| `cache_max_gb` | Maximum disk space used for cached bundles |
-| `keep_mod_versions` | How many old versions of each mod to keep |
-| `bundle_ttl_days` | How long cached bundles are kept before cleanup |
-| `auth_url` | Optional external URL for Steam ID validation |
-
----
-
-## How It Works
+## How it works (v2)
 
 ```
-Server                          Client
-  │                               │
-  ├─ Scans mods folder            │
-  ├─ Builds manifest (hashes)     │
-  ├─ Starts HTTP server           │
-  │                               │
-  │    ◄── GET /manifest ─────────┤
-  │    ──── manifest.json ────►   │
-  │                               ├─ Compares with local files
-  │    ◄── GET /mod/<file> ───────┤  (downloads only what changed)
-  │    ──── file bytes ────────►  │
-  │                               ├─ Places files in Mods folder
+Server                              Clients
+  │                                    │
+  ├─ Scans Mods folder                 │
+  ├─ Builds torrent snapshot           │
+  ├─ Starts seeding (libtorrent)       │
+  ├─ Embedded tracker /announce        │
+  │                                    │
+  │   ◄── GET /api/v2/build ───────────┤  check current build hash
+  │   ◄── GET /api/v2/manifest ────────┤  download file list + hashes
+  │   ◄── GET /api/v2/torrent ─────────┤  download .torrent file
+  │                                    │
+  │   ◄── /announce ───────────────────┤  peer announces to tracker
+  │   ──── compact peer list ──────►   │  tracker returns swarm
+  │                                    │
+  │   ←────── BitTorrent P2P ─────────►│  peers exchange pieces
 ```
+
+The v1 HTTP protocol (`GET /manifest`, `GET /mod/<id>`) remains available as fallback.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 ModSync/
-├── server_app.py   # Server: HTTP file server + PyQt6 GUI
-└── client_app.py   # Client: sync logic + PyQt6 GUI
+├── server_app.py    # Server GUI + embedded HTTP server + SQLite
+├── client_app.py    # Client GUI + sync logic
+└── modsync_v2.py    # Shared: BitTorrent engine, tracker, build pipeline
 ```
 
 ---
 
 ## License
 
-MIT — do whatever you want with it.
+MIT
 
 ---
-
 ---
 
 # 🇷🇺 Русская версия
@@ -167,121 +151,104 @@ MIT — do whatever you want with it.
 
 ## О проекте
 
-ModSync — лёгкое клиент-серверное приложение для синхронизации модов. Владелец сервера запускает `server_app.py`, указывает папку с модами и сообщает адрес игрокам. Игроки запускают `client_app.py`, вводят адрес — и их моды автоматически обновляются до актуальной версии.
+ModSync — клиент-серверное приложение для синхронизации модов. Владелец сервера запускает `server_app.py`, указывает папку с модами и сообщает адрес. Игроки запускают `client_app.py`, вводят адрес — моды обновляются автоматически.
 
-Никаких «не та версия мода». Никаких zip-архивов в Discord.
+**v2** раздаёт файлы через BitTorrent: игроки сидируют друг другу в процессе загрузки, поэтому канал хоста не является узким местом. Встроенный трекер и резервный HTTP-протокол работают на одном порту одновременно.
 
 ---
 
 ## Возможности
 
-- **Автоматическая синхронизация** — клиент скачивает только изменившиеся файлы (сравнение по манифесту)
-- **Whitelist Steam ID** — контроль над тем, кто может подключаться и скачивать моды
-- **Управление кэшем** — настраиваемый размер кэша, количество хранимых версий, TTL
-- **Слежение за файлами** — сервер автоматически обнаруживает новые и изменённые моды, перезапуск не нужен
-- **Тёмный интерфейс** — PyQt6 с индикаторами статуса, таблицей клиентов и ползунками для настроек кэша
-- **Авторизация** — опциональная проверка Steam ID через внешний URL
+- **P2P-раздача** — синхронизация через BitTorrent (libtorrent) со встроенным трекером
+- **Автоматическая синхронизация** — клиент скачивает только изменившиеся файлы
+- **UPnP / NAT-PMP** — автоматический проброс портов для входящих P2P-соединений
+- **Whitelist Steam ID** — контроль доступа; поддержка внешнего URL авторизации
+- **Слежение за файлами** — сервер обнаруживает изменения без перезапуска
+- **Авто-публикация при рестарте** — определяет перезапуск 7DaysToDieServer.exe и переиздаёт сборку
+- **Тёмный glassmorphism UI** — PyQt6, EN/RU
+- **Двойной протокол** — v2 BitTorrent + v1 HTTP-резерв на одном порту
 
 ---
 
 ## Скачать
 
-**Не хочешь возиться с Python?** Скачай готовые `.exe` со страницы [Releases](https://github.com/Leo111444/ModSync/releases) — просто запусти и всё.
+Готовые `.exe` для Windows (Python не нужен) — на странице [Releases](https://github.com/Leo111444/ModSync/releases).
+
+Скачай и распакуй zip — папку `_internal` оставь рядом с `.exe`.
 
 ---
 
-## Требования
+## Требования (запуск из исходников)
 
-- Python 3.10 и выше
+- Python 3.10+
 - PyQt6
-
-Установка зависимостей:
+- libtorrent (Python-биндинги)
 
 ```bash
-pip install PyQt6
+pip install -r requirements.txt
+```
+
+---
+
+## Запуск из исходников
+
+```bash
+python server_app.py   # GUI сервера
+python client_app.py   # GUI клиента
 ```
 
 ---
 
 ## Сборка в EXE
 
-Если хочешь собрать `.exe` самостоятельно:
-
 ```bash
 pip install pyinstaller
-```
-
-**Сервер:**
-```bash
 pyinstaller --onefile --windowed --name ModSync-Server server_app.py
-```
-
-**Клиент:**
-```bash
 pyinstaller --onefile --windowed --name ModSync-Client client_app.py
 ```
 
-Готовые файлы появятся в папке `dist/`. Флаг `--windowed` скрывает консоль — у обоих приложений есть GUI.
-
 ---
 
-## Запуск
+## Использование
 
 ### Сервер (хост)
 
-```bash
-python server_app.py
-```
-
 1. Укажи путь к папке `Mods`
-2. Задай порт (по умолчанию подойдёт для локальной сети; для интернета — открой порт в роутере)
-3. Добавь Steam ID игроков в whitelist
-4. Нажми **Start**
-5. Сообщи игрокам свой IP и порт
+2. Задай порт (по умолчанию 8766; открой в роутере или доверь UPnP)
+3. Добавь Steam ID игроков в whitelist (или переключись в режим Open)
+4. Нажми **Publish** — сервер создаёт снапшот-торрент и начинает сидировать
+5. Сообщи игрокам внешний IP и порт
 
 ### Клиент (игроки)
 
-```bash
-python client_app.py
-```
-
 1. Введи адрес сервера (`ip:port`)
 2. Введи свой Steam ID
-3. Нажми **Sync** — недостающие и устаревшие моды скачаются автоматически
+3. Нажми **Check** — недостающие моды загружаются через P2P
+4. Включи **P2P sharing** чтобы сидировать другим игрокам
 
 ---
 
-## Настройки
-
-Настройки сохраняются автоматически через интерфейс. Основные параметры:
-
-| Параметр | Описание |
-|---|---|
-| `mods_path` | Путь к папке с модами |
-| `port` | Порт HTTP-сервера |
-| `cache_max_gb` | Максимальный объём диска для кэша бандлов |
-| `keep_mod_versions` | Сколько старых версий каждого мода хранить |
-| `bundle_ttl_days` | Через сколько дней удалять устаревшие бандлы |
-| `auth_url` | Внешний URL для проверки Steam ID (опционально) |
-
----
-
-## Как это работает
+## Как это работает (v2)
 
 ```
-Сервер                          Клиент
-  │                               │
-  ├─ Сканирует папку модов        │
-  ├─ Строит манифест (хэши)       │
-  ├─ Запускает HTTP-сервер        │
-  │                               │
-  │    ◄── GET /manifest ─────────┤
-  │    ──── manifest.json ────►   │
-  │                               ├─ Сравнивает с локальными файлами
-  │    ◄── GET /mod/<file> ───────┤  (скачивает только изменения)
-  │    ──── байты файла ───────►  │
-  │                               ├─ Кладёт файлы в папку Mods
+Сервер                              Клиенты
+  │                                    │
+  ├─ Сканирует папку модов             │
+  ├─ Создаёт торрент-снапшот           │
+  ├─ Начинает сидировать               │
+  ├─ Встроенный трекер /announce       │
+  │                                    │
+  │   ◄── GET /api/v2/build ───────────┤  проверка хэша сборки
+  │   ◄── GET /api/v2/manifest ────────┤  список файлов с хэшами
+  │   ◄── GET /api/v2/torrent ─────────┤  скачать .torrent
+  │                                    │
+  │   ◄── /announce ───────────────────┤  пир анонсирует себя
+  │   ──── список пиров ─────────────► │  трекер возвращает рой
+  │                                    │
+  │   ←────── BitTorrent P2P ─────────►│  пиры обмениваются кусками
 ```
+
+Протокол v1 (`GET /manifest`, `GET /mod/<id>`) доступен как резервный.
 
 ---
 
@@ -289,12 +256,13 @@ python client_app.py
 
 ```
 ModSync/
-├── server_app.py   # Сервер: HTTP-раздача файлов + GUI (PyQt6)
-└── client_app.py   # Клиент: логика синхронизации + GUI (PyQt6)
+├── server_app.py    # GUI сервера + встроенный HTTP-сервер + SQLite
+├── client_app.py    # GUI клиента + логика синхронизации
+└── modsync_v2.py    # Общий модуль: BitTorrent-движок, трекер, пайплайн сборки
 ```
 
 ---
 
 ## Лицензия
 
-MIT — делай что хочешь.
+MIT

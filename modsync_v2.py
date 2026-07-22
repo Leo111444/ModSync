@@ -8,7 +8,7 @@ ModSync v2: пофайловая синхронизация поверх BitTorr
   Tracker       — встроенный HTTP-трекер (in-memory, compact peers)
   handle_v2_*   — обработчики HTTP-роутов для встраивания в ApiHandler
 
-Зависимости: libtorrent >= 2.0
+Зависимости: libtorrent >= 2.0 
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import libtorrent as lt
 
 PIECE_SIZE = 4 * 1024 * 1024  # 4 MiB
 ANNOUNCE_INTERVAL = 1800       # сек, отдаём клиентам
-PEER_TTL = ANNOUNCE_INTERVAL * 2
+PEER_TTL = 300                 # 5 минут — быстро чистим протухших
 JUNK_NAMES = {"thumbs.db", "desktop.ini", ".ds_store"}
 LAN_DISCOVERY_UDP_PORT = 58765  # fixed port for LAN broadcast discovery
 
@@ -319,7 +319,6 @@ class BuildManager:
                 raise RuntimeError("снапшот пуст")
 
             t = lt.create_torrent(fs, PIECE_SIZE, flags=lt.create_torrent.v2_only)
-            t.set_priv(True)
             t.set_creator("ModSync")
             if tracker_url_local:
                 t.add_tracker(tracker_url_local, 0)
@@ -410,8 +409,14 @@ class BuildManager:
             if final_dir.exists():
                 import shutil as _sh
                 _sh.rmtree(final_dir, ignore_errors=True)
-            os.rename(staging, final_dir)
-            staging = None  # успешно переехал — в finally не трогаем
+            if final_dir.exists():
+                # сидер держит файлы залоченными — тот же build_id = тот же контент
+                import shutil as _sh
+                _sh.rmtree(staging, ignore_errors=True)
+                staging = None
+            else:
+                os.rename(staging, final_dir)
+                staging = None  # успешно переехал — в finally не трогаем
 
             with self.lock:
                 self.build_id = build_id
@@ -499,10 +504,11 @@ class TorrentEngine:
         self.listen_port = listen_port
         self.session = lt.session({
             "listen_interfaces": f"0.0.0.0:{listen_port}",
-            "enable_dht": False,
-            "enable_lsd": False,
+            "enable_dht": True,
+            "enable_lsd": True,
             "enable_upnp": True,
             "enable_natpmp": True,
+            "allow_multiple_connections_per_ip": True,
             "alert_mask": lt.alert.category_t.error_notification
                         | lt.alert.category_t.status_notification
                         | lt.alert.category_t.port_mapping_notification,
@@ -549,18 +555,32 @@ class TorrentEngine:
             "total_upload": st.total_upload,
         }
 
+    def set_announce_ip(self, ip: str) -> None:
+        if ip and not _is_private_ip(ip):
+            try:
+                self.session.apply_settings({"announce_ip": ip})
+            except Exception:
+                pass
+
     def pump_alerts(self) -> list[str]:
         """Звать периодически (QTimer). Возвращает строки для лога."""
         out = []
         for a in self.session.pop_alerts():
             cat = a.category()
-            msg = a.message()
+            try:
+                msg = a.message()
+            except (UnicodeDecodeError, Exception):
+                msg = f"<{type(a).__name__}>"
             if cat & lt.alert.category_t.port_mapping_notification:
                 out.append(f"[V2][UPnP-seed] {msg}")
             elif cat & lt.alert.category_t.error_notification:
                 if "skipping tracker announce" in msg:
                     continue
                 out.append(f"[V2][lt] {msg}")
+            elif "external" in msg.lower() and "ip" in msg.lower():
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", msg)
+                if m and not _is_private_ip(m.group(1)):
+                    self.set_announce_ip(m.group(1))
         return out
 
     def stop(self) -> None:
@@ -594,14 +614,13 @@ class Tracker:
         self.lock = threading.Lock()
         # {info_hash(20b): {peer_id(20b): (ip_str, port, last_seen, left)}}
         self.swarms: dict[bytes, dict[bytes, tuple]] = {}
-        # (lan_ip, lan_port) → (ext_ip, ext_port) — для подмены LAN адресов внешним
+        # (private_ip, port) → (ext_ip, ext_port) — fallback для LAN-пиров без UPnP
         self._ext_map: dict[tuple[str, int], tuple[str, int]] = {}
 
-    def set_peer_external(self, lan_ip: str, lan_port: int,
+    def set_peer_external(self, private_ip: str, private_port: int,
                           ext_ip: str, ext_port: int) -> None:
-        """Регистрирует внешний адрес для LAN-пира чтобы трекер отдавал его удалённым клиентам."""
         with self.lock:
-            self._ext_map[(lan_ip, lan_port)] = (ext_ip, ext_port)
+            self._ext_map[(private_ip, private_port)] = (ext_ip, ext_port)
 
     def announce(self, info_hash: bytes, peer_id: bytes, ip: str, port: int,
                  left: int, event: str) -> bytes:
@@ -613,7 +632,7 @@ class Tracker:
             else:
                 swarm[peer_id] = (ip, port, now, left)
             # чистка протухших
-            dead = [pid for pid, (_, _, ts, _) in swarm.items() if now - ts > PEER_TTL]
+            dead = [pid for pid, v in swarm.items() if now - v[2] > PEER_TTL]
             for pid in dead:
                 swarm.pop(pid, None)
             peers = [(v[0], v[1]) for pid, v in swarm.items() if pid != peer_id]
@@ -624,20 +643,27 @@ class Tracker:
         requester_external = not _is_private_ip(ip)
 
         compact = b""
-        for ip_s, p in peers[:50]:
+        seen_endpoints: set[tuple[str, int]] = set()
+        for ip_s, p in peers[:200]:
             if requester_external and _is_private_ip(ip_s):
-                # Внешний клиент не может достучаться до LAN-адреса —
-                # подменяем на известный внешний адрес, иначе пропускаем
+                # Внешний клиент не может достучаться до приватного IP —
+                # подменяем на известный внешний, иначе пропускаем
                 mapped = ext_map_snapshot.get((ip_s, p))
                 if mapped:
                     ip_s, p = mapped
                 else:
                     continue
+            # дедупликация: один IP:port — одна запись
+            if (ip_s, p) in seen_endpoints:
+                continue
+            seen_endpoints.add((ip_s, p))
             try:
                 packed_ip = bytes(int(x) for x in ip_s.split("."))
                 if len(packed_ip) != 4:
                     continue
                 compact += packed_ip + struct.pack(">H", p)
+                if len(compact) >= 50 * 6:
+                    break
             except Exception:
                 continue
 
@@ -733,15 +759,32 @@ def handle_v2_get(handler, parsed, v2: V2State, mods_root: Path,
         if len(info_hash) != 20 or len(peer_id) != 20 or not (0 < port < 65536):
             body = Tracker.failure("bad announce")
         else:
-            ip = handler._get_client_ip()
+            conn_ip = handler._get_client_ip()
+            reported_ip = q.get(b"ip", b"").decode("ascii", "ignore").strip()
+            ip = reported_ip if (reported_ip and not _is_private_ip(reported_ip)) else conn_ip
+            # Loopback-анонс от сервера самому себе — подменяем на внешний IP если известен,
+            # иначе внешние клиенты никогда не получат адрес сервера из трекера
+            if (ip == "127.0.0.1" or ip == "::1") and v2.external_ip and event != "stopped":
+                ip = v2.external_ip
             body = v2.tracker.announce(info_hash, peer_id, ip, port, left, event)
-            if (v2.external_ip and _is_private_ip(ip)
-                    and port > 0 and event != "stopped"):
+            # Для приватных IP (LAN без UPnP) — фиксируем маппинг на внешний адрес,
+            # чтобы внешние клиенты могли достучаться
+            if _is_private_ip(ip) and v2.external_ip and port > 0 and event != "stopped":
                 v2.tracker.set_peer_external(ip, port, v2.external_ip, port)
+            # Новый скачивальщик: сообщаем серверному движку чтобы он переанонсировался
+            # и подключился к нему как можно скорее
+            if event == "started" and left > 0 and v2.engine is not None:
+                h = v2.engine.handle
+                if h is not None:
+                    try:
+                        h.force_reannounce(0, -1)
+                    except Exception:
+                        pass
             swarm = v2.tracker.get_swarm(info_hash)
             if swarm:
-                peer_list = " | ".join(f"{sip}:{sp}({'S' if sl==0 else 'D'})"
-                                       for sip, sp, sl in swarm)
+                peer_list = " | ".join(
+                    f"{sip}:{sp}({'S' if sl == 0 else 'D'})" for sip, sp, sl in swarm
+                )
                 handler.log_message("[SWARM] %s", peer_list)
 
         handler.send_response(200)
@@ -955,12 +998,14 @@ class ClientEngine:
         self.port = actual_port
         self.session = lt.session({
             "listen_interfaces": f"0.0.0.0:{actual_port}",
-            "enable_dht": False,
-            "enable_lsd": True,
+            "enable_dht": True,
+            "enable_lsd": False,
             "enable_upnp": True,
             "enable_natpmp": True,
-            "enable_outgoing_utp": True,
-            "enable_incoming_utp": True,
+            "enable_outgoing_utp": False,
+            "enable_incoming_utp": False,
+            "allow_multiple_connections_per_ip": True,
+            "aio_threads": 4,
             "alert_mask": lt.alert.category_t.error_notification
                         | lt.alert.category_t.status_notification
                         | lt.alert.category_t.port_mapping_notification
@@ -970,6 +1015,13 @@ class ClientEngine:
         self.handle: "lt.torrent_handle | None" = None
         self._lock = threading.Lock()
         self._share = True
+        self._ext_ip: str = ""
+        self._port_open: bool = False
+        self._port_method: str = ""
+        self._port_mapping_done: bool = False
+        self._upnp_failed: bool = False
+        self._natpmp_failed: bool = False
+        self._session_start: float = time.time()
         self._num_files = 0
         self._file_tops: list[str] = []   # idx → имя мода (top dir), '' для падов
         self._file_sizes: list[int] = []
@@ -981,11 +1033,12 @@ class ClientEngine:
     # ---------- запуск обновления ----------
 
     def update(self, torrent_bytes: bytes, mods_dir: Path,
-               server_url: str, share: bool = True) -> None:
+               server_url: str, share: bool = True,
+               seed_mode: bool = False) -> None:
         """
-        Добавляет торрент: libtorrent сам сверит существующие файлы по хешам
-        (checking_files) и докачает только отличающееся.
-        mods_dir — папка Mods клиента; файлы пишутся прямо в неё.
+        Добавляет торрент.
+        seed_mode=True: пропустить хэш-проверку (безопасно только когда файлы уже верифицированы).
+        seed_mode=False (по умолчанию): libtorrent проверит все куски перед скачиванием.
         """
         mods_dir = Path(mods_dir)
         server_url = server_url.rstrip("/")
@@ -1026,6 +1079,8 @@ class ClientEngine:
         params.trackers = [f"{server_url}/announce"]
         params.flags &= ~lt.torrent_flags.paused
         params.flags &= ~lt.torrent_flags.auto_managed
+        if seed_mode:
+            params.flags |= lt.torrent_flags.seed_mode
 
         with self._lock:
             self._share = share
@@ -1115,26 +1170,65 @@ class ClientEngine:
         except Exception:
             pass
 
+    def seeding_status(self) -> dict:
+        done = self._port_mapping_done or (time.time() - self._session_start > 10)
+        return {
+            "port_open": self._port_open,
+            "port_method": self._port_method,
+            "port_mapping_done": done,
+        }
+
     def pump_alerts(self) -> list[str]:
         out = []
         for a in self.session.pop_alerts():
             cat = a.category()
-            msg = a.message()
+            try:
+                msg = a.message()
+            except (UnicodeDecodeError, Exception):
+                msg = f"<{type(a).__name__}>"
+            atype = type(a).__name__
             if cat & lt.alert.category_t.port_mapping_notification:
                 out.append(f"[V2][UPnP] {msg}")
+                if atype == "portmap_alert":
+                    self._port_open = True
+                    self._port_mapping_done = True
+                    msg_lo = msg.lower()
+                    if "nat-pmp" in msg_lo or "natpmp" in msg_lo:
+                        self._port_method = "NAT-PMP"
+                    else:
+                        self._port_method = "UPnP"
+                elif atype == "portmap_error_alert":
+                    msg_lo = msg.lower()
+                    if "nat-pmp" in msg_lo or "natpmp" in msg_lo:
+                        self._natpmp_failed = True
+                    else:
+                        self._upnp_failed = True
+                    if self._upnp_failed and self._natpmp_failed:
+                        self._port_mapping_done = True
             elif cat & lt.alert.category_t.tracker_notification:
                 if "skipping tracker announce" in msg:
                     continue
                 out.append(f"[V2][TR] {msg}")
             elif cat & lt.alert.category_t.peer_notification:
-                t = type(a).__name__
-                if t in ("peer_connect_alert", "peer_disconnected_alert",
-                         "incoming_connection_alert"):
+                if atype in ("peer_connect_alert", "peer_disconnected_alert",
+                             "incoming_connection_alert"):
                     out.append(f"[V2][PEER] {msg}")
             elif cat & lt.alert.category_t.error_notification:
                 out.append(f"[V2][lt] {msg}")
             elif "external" in msg.lower() and "ip" in msg.lower():
                 out.append(f"[V2][IP] {msg}")
+                m = re.search(r"(\d+\.\d+\.\d+\.\d+)", msg)
+                if m:
+                    ext_ip = m.group(1)
+                    if not _is_private_ip(ext_ip) and ext_ip != self._ext_ip:
+                        self._ext_ip = ext_ip
+                        try:
+                            self.session.apply_settings({"announce_ip": ext_ip})
+                            with self._lock:
+                                if self.handle is not None:
+                                    self.handle.force_reannounce(0, -1)
+                        except Exception:
+                            pass
         return out
 
     def stop(self) -> None:

@@ -3232,6 +3232,8 @@ class ServerWindow(QWidget):
             self.state.external_ip = ext_ip
             if self.state.v2 is not None:
                 self.state.v2.external_ip = ext_ip
+                if self.state.v2.engine is not None:
+                    self.state.v2.engine.set_announce_ip(ext_ip)
             self.append_log(self.tr("log_ext_ip", ip=ext_ip))
             self._status_lbl_signal.emit(ext_running)
         except Exception as e:

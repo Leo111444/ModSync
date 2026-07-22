@@ -657,6 +657,12 @@ TRANSLATIONS = {
         "st_verify_failed":         "needs update (verify failed)",
         "st_p2p_idle":              "P2P · waiting",
         "st_p2p_seeding":           "P2P  ↑{spd} MB/s · {peers} peer{s}",
+        "st_seed_ok":               "P2P · seeding · {method} ✓ · ↑{spd} MB/s · {peers} peer{s}",
+        "st_seed_ok_idle":          "P2P · seeding ready · {method} ✓",
+        "st_seed_checking":         "P2P · checking port…",
+        "st_seed_no_port":          "P2P · download only (port closed)",
+        "st_seed_starting":         "P2P · starting engine…",
+        "st_p2p_disabled":          "P2P · seeding disabled",
     },
     "ru": {
         # Window
@@ -838,6 +844,12 @@ TRANSLATIONS = {
         "st_verify_failed":         "нужно обновление (ошибка проверки)",
         "st_p2p_idle":              "P2P · ожидание",
         "st_p2p_seeding":           "P2P  ↑{spd} МБ/с · {peers} пир{s}",
+        "st_seed_ok":               "P2P · раздача · {method} ✓ · ↑{spd} МБ/с · {peers} пир{s}",
+        "st_seed_ok_idle":          "P2P · раздача готова · {method} ✓",
+        "st_seed_checking":         "P2P · проверка порта…",
+        "st_seed_no_port":          "P2P · только загрузка (порт закрыт)",
+        "st_seed_starting":         "P2P · движок запускается…",
+        "st_p2p_disabled":          "P2P · раздача отключена",
     },
 }
 
@@ -1032,6 +1044,7 @@ class UiBridge(QObject):
     download_progress = pyqtSignal(int, float)  # pct 0-100, speed MB/s
 
     start_check = pyqtSignal(str)  # context: "manual"/"auto"
+    seed_ready = pyqtSignal(bytes, str, str)  # torrent_bytes, base_url, mods_dir
 @dataclass
 class DiffResult:
     server_manifest_hash: str
@@ -1198,6 +1211,9 @@ class ClientWindow(QWidget):
         self._auto_download_started = False
         self._auto_last_start_ts = 0.0
 
+        self._v2_last_state: str = ""
+        self._v2_last_logged_pct: int = -1
+
         # bridge
         self.bridge = UiBridge()
         self.bridge.log.connect(self.append_log)
@@ -1209,6 +1225,7 @@ class ClientWindow(QWidget):
         self.bridge.toast.connect(self.show_toast)
         self.bridge.steamid_ready.connect(self.on_steamid_ready)
         self.bridge.download_progress.connect(self.on_download_progress)
+        self.bridge.seed_ready.connect(self._on_seed_ready)
 
         self._ping_last = 0.0  # 1s debounce for ping
         self._ms_servers_signal.connect(self._populate_server_combo)
@@ -1598,7 +1615,7 @@ class ClientWindow(QWidget):
 
         # Start seed engine on launch if share was already enabled
         if bool(self.cfg.get("p2p_share", True)):
-            QTimer.singleShot(3000, self._try_start_seed_engine)
+            QTimer.singleShot(500, self._try_start_seed_engine)
 
     # ---------------- Rules ----------------
 
@@ -2086,7 +2103,7 @@ class ClientWindow(QWidget):
                 # Автозапуск проверки обновлений при первом получении списка серверов
                 if not getattr(self, "_startup_check_done", False):
                     self._startup_check_done = True
-                    QTimer.singleShot(500, lambda: self.bridge.start_check.emit("auto"))
+                    QTimer.singleShot(0, lambda: self.bridge.start_check.emit("auto"))
 
     # ---------------- Status timers ----------------
 
@@ -2367,6 +2384,7 @@ class ClientWindow(QWidget):
             return
 
         def worker():
+            self.bridge.log.emit(f"[CHECK] Подключаюсь к серверу…")
             self.bridge.set_busy.emit(True)
             try:
                 b = self._resolve_base(base).rstrip("/")
@@ -2432,6 +2450,7 @@ class ClientWindow(QWidget):
                     "_v2_files": {"missing": len(qd["missing"]),
                                   "changed": len(qd["changed"])},
                 }
+                self.bridge.log.emit(f"[CHECK] Сканирование модов…")
                 self.bridge.log.emit(
                     f"[V2] build {build['build_id']}: файлов не хватает {len(qd['missing'])}, "
                     f"изменено {len(qd['changed'])}, лишних {len(qd['orphans'])}")
@@ -2440,23 +2459,10 @@ class ClientWindow(QWidget):
                     self.bridge.status.emit(self.tr("st_update_ready"))
                 else:
                     self.bridge.status.emit(self.tr("st_up_to_date"))
-                    # P2P seeding: engine must be created in main thread
-                    if self.share_btn.isChecked() and self.v2_engine is None:
+                    if self.cfg.get("p2p_share", True) and self.v2_engine is None:
                         try:
                             torrent_bytes = modsync_v2.fetch_bytes(b + "/api/v2/torrent")
-                            def _start_seed(tb=torrent_bytes, base_url=b, md=mods_dir):
-                                try:
-                                    if self.v2_engine is None:
-                                        self.v2_engine = modsync_v2.ClientEngine(
-                                            listen_port=0,
-                                            log_cb=lambda m: self.bridge.log.emit(m))
-                                    self.v2_engine.update(
-                                        tb, Path(md), base_url, share=True)
-                                    self.bridge.log.emit("[V2] P2P раздача запущена (моды актуальны)")
-                                    self._v2_poll_timer.start()
-                                except Exception as _e:
-                                    self.bridge.log.emit(f"[V2] не удалось запустить раздачу: {_e}")
-                            QTimer.singleShot(0, _start_seed)
+                            self.bridge.seed_ready.emit(torrent_bytes, b, mods_dir)
                         except Exception as _e:
                             self.bridge.log.emit(f"[V2] не удалось получить торрент: {_e}")
             except HTTPError as e:
@@ -2594,6 +2600,9 @@ class ClientWindow(QWidget):
                 self.append_log("[AUTO] Updates found -> auto download")
                 self.on_download_bundle()
         self.update_action_buttons()
+        # Запускаем P2P-таймер сразу после проверки — статус виден всегда
+        if not self._v2_poll_timer.isActive():
+            self._v2_poll_timer.start()
 
 
     def on_download_bundle(self):
@@ -2651,7 +2660,18 @@ class ClientWindow(QWidget):
         self._v2_poll_timer.start()
 
     def _v2_poll(self):
+        _lbl_grey   = "color: #5a6070; font-size: 12px; background: transparent; padding-left: 6px;"
+        _lbl_yellow = "color: #f59e0b; font-size: 12px; background: transparent; padding-left: 6px;"
+        _lbl_green  = "color: #4ade80; font-size: 12px; background: transparent; padding-left: 6px;"
+        _lbl_red    = "color: #6b7280; font-size: 12px; background: transparent; padding-left: 6px;"
+
         if self.v2_engine is None:
+            if self.cfg.get("p2p_share", True):
+                self._p2p_info_lbl.setText(self.tr("st_seed_starting"))
+                self._p2p_info_lbl.setStyleSheet(_lbl_yellow)
+            else:
+                self._p2p_info_lbl.setText(self.tr("st_p2p_disabled"))
+                self._p2p_info_lbl.setStyleSheet(_lbl_grey)
             return
         for msg in self.v2_engine.pump_alerts():
             self.append_log(msg)
@@ -2659,18 +2679,46 @@ class ClientWindow(QWidget):
         if not p.get("active"):
             if self.v2_updating:
                 return  # торрент ещё добавляется в worker-потоке
-            self._v2_poll_timer.stop()
+            self._p2p_info_lbl.setText(self.tr("st_seed_starting"))
+            self._p2p_info_lbl.setStyleSheet(_lbl_yellow)
             return
 
         pct = int(p["progress"] * 100)
         speed_mbs = p["download_rate"] / (1024 * 1024)
         if self.v2_updating:
             state = p["state"]
+            peers_dl = p["peers"]
+            # log state transitions
+            if state != self._v2_last_state:
+                self._v2_last_state = state
+                self.append_log(f"[V2] → состояние: {state}")
+                self._v2_last_logged_pct = -1
+                if state == "downloading" and self.v2_engine and self.v2_engine.handle:
+                    try:
+                        self.v2_engine.handle.force_reannounce(0, -1)
+                        self.append_log("[V2] Запрашиваю свежий список пиров…")
+                    except Exception:
+                        pass
             if state == "checking":
                 self.bridge.status.emit(self.tr("st_verify", pct=pct))
+                self._p2p_info_lbl.setText(f"P2P · проверка файлов {pct}%")
+                self._p2p_info_lbl.setStyleSheet(_lbl_yellow)
+                # log every 25%
+                log_pct = (pct // 25) * 25
+                if log_pct > self._v2_last_logged_pct:
+                    self._v2_last_logged_pct = log_pct
+                    self.append_log(f"[V2] Проверка файлов: {pct}%")
             else:
                 self.bridge.status.emit(self.tr("st_downloading",
-                    pct=pct, spd=f"{speed_mbs:.1f}", peers=p["peers"]))
+                    pct=pct, spd=f"{speed_mbs:.1f}", peers=peers_dl))
+                self._p2p_info_lbl.setText(f"P2P · загрузка {pct}% · {peers_dl} пир" +
+                    ("а" if 2 <= peers_dl % 10 <= 4 else "ов" if peers_dl % 10 != 1 else ""))
+                self._p2p_info_lbl.setStyleSheet(_lbl_green if peers_dl > 0 else _lbl_yellow)
+                # log every 10%
+                log_pct = (pct // 10) * 10
+                if log_pct > self._v2_last_logged_pct:
+                    self._v2_last_logged_pct = log_pct
+                    self.append_log(f"[V2] Загрузка: {pct}% · {speed_mbs:.1f} МБ/с · {peers_dl} пир")
             self.bridge.download_progress.emit(pct, speed_mbs)
             if p.get("done"):
                 self._v2_on_done()
@@ -2678,17 +2726,23 @@ class ClientWindow(QWidget):
             # режим сида после обновления
             up_mbs = p["upload_rate"] / (1024 * 1024)
             peers = p["peers"]
-            if peers > 0 or up_mbs > 0.05:
-                _ru = self._lang == "ru"
-                _s = ("а" if 2 <= peers % 10 <= 4 else "ов" if peers % 10 != 1 else "") if _ru else ("s" if peers != 1 else "")
-                self._p2p_info_lbl.setText(self.tr("st_p2p_seeding",
-                    spd=f"{up_mbs:.1f}", peers=peers, s=_s))
-                self._p2p_info_lbl.setStyleSheet(
-                    "color: #4ade80; font-size: 12px; background: transparent; padding-left: 6px;")
+            seed_st = self.v2_engine.seeding_status()
+            _ru = self._lang == "ru"
+            _s = ("а" if 2 <= peers % 10 <= 4 else "ов" if peers % 10 != 1 else "") if _ru else ("s" if peers != 1 else "")
+            if seed_st["port_open"]:
+                method = seed_st["port_method"]
+                if peers > 0 or up_mbs > 0.05:
+                    self._p2p_info_lbl.setText(self.tr("st_seed_ok",
+                        method=method, spd=f"{up_mbs:.1f}", peers=peers, s=_s))
+                else:
+                    self._p2p_info_lbl.setText(self.tr("st_seed_ok_idle", method=method))
+                self._p2p_info_lbl.setStyleSheet(_lbl_green)
+            elif not seed_st["port_mapping_done"]:
+                self._p2p_info_lbl.setText(self.tr("st_seed_checking"))
+                self._p2p_info_lbl.setStyleSheet(_lbl_yellow)
             else:
-                self._p2p_info_lbl.setText(self.tr("st_p2p_idle"))
-                self._p2p_info_lbl.setStyleSheet(
-                    "color: #5a6070; font-size: 12px; background: transparent; padding-left: 6px;")
+                self._p2p_info_lbl.setText(self.tr("st_seed_no_port"))
+                self._p2p_info_lbl.setStyleSheet(_lbl_red)
 
     def _v2_on_done(self):
         self.v2_updating = False
@@ -2793,21 +2847,30 @@ class ClientWindow(QWidget):
         def worker():
             try:
                 torrent_bytes = modsync_v2.fetch_bytes(b + "/api/v2/torrent")
-                def _start(tb=torrent_bytes, base_url=b, md=mods_dir):
-                    try:
-                        if self.v2_engine is None:
-                            self.v2_engine = modsync_v2.ClientEngine(
-                                listen_port=0,
-                                log_cb=lambda m: self.bridge.log.emit(m))
-                        self.v2_engine.update(tb, Path(md), base_url, share=True)
-                        self.bridge.log.emit("[V2] P2P раздача запущена")
-                        self._v2_poll_timer.start()
-                    except Exception as e:
-                        self.bridge.log.emit(f"[V2] ошибка старта раздачи: {e}")
-                QTimer.singleShot(0, _start)
+                self.bridge.seed_ready.emit(torrent_bytes, b, mods_dir)
             except Exception as e:
                 self.bridge.log.emit(f"[V2] не удалось получить торрент: {e}")
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_seed_ready(self, torrent_bytes: bytes, base_url: str, mods_dir: str):
+        """Слот главного потока: создаёт движок и добавляет торрент для раздачи."""
+        if self.v2_updating:
+            return  # идёт загрузка — не трогаем
+        if self.v2_engine is not None and self.v2_engine.handle is not None:
+            return  # уже активен
+        try:
+            if self.v2_engine is None:
+                self.v2_engine = modsync_v2.ClientEngine(
+                    listen_port=0, log_cb=lambda m: self.bridge.log.emit(m))
+            # seed_mode=True: файлы только что верифицированы quick_local_diff,
+            # пропускаем хэш-проверку libtorrent (несколько минут → мгновенно)
+            self.v2_engine.update(torrent_bytes, Path(mods_dir), base_url,
+                                  share=True, seed_mode=True)
+            self.append_log("[V2] P2P раздача запущена")
+            if not self._v2_poll_timer.isActive():
+                self._v2_poll_timer.start()
+        except Exception as e:
+            self.append_log(f"[V2] ошибка старта раздачи: {e}")
 
     def _send_heartbeat(self):
         if getattr(self, "v2_updating", False):
