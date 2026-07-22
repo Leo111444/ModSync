@@ -33,3 +33,10 @@ Thumbs.db
 .claude/
 cc.cmd
 cc-vscode.cmd
+
+# Unused / internal
+modsync_worker.py
+test_client_download.py
+CLAUDE.md
+TODO_v2.md
+gitignore
