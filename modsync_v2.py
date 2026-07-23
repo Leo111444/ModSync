@@ -410,10 +410,28 @@ class BuildManager:
                 import shutil as _sh
                 _sh.rmtree(final_dir, ignore_errors=True)
             if final_dir.exists():
-                # сидер держит файлы залоченными — тот же build_id = тот же контент
+                # rmtree не удалось (сидер держит файлы) — проверяем infohash:
+                # если совпадает, содержимое идентично и можно переиспользовать.
+                # Если нет — коллизия build_id (32-бит), переименовываем старую папку.
                 import shutil as _sh
-                _sh.rmtree(staging, ignore_errors=True)
-                staging = None
+                reuse = False
+                with self.lock:
+                    reuse = (self.infohash_v2 == infohash_v2)
+                if reuse:
+                    _sh.rmtree(staging, ignore_errors=True)
+                    staging = None
+                else:
+                    old_dir = final_dir.parent / (final_dir.name + "_old")
+                    if old_dir.exists():
+                        _sh.rmtree(old_dir, ignore_errors=True)
+                    try:
+                        os.rename(final_dir, old_dir)
+                        os.rename(staging, final_dir)
+                        staging = None
+                        _sh.rmtree(old_dir, ignore_errors=True)
+                    except OSError:
+                        _sh.rmtree(staging, ignore_errors=True)
+                        staging = None
             else:
                 os.rename(staging, final_dir)
                 staging = None  # успешно переехал — в finally не трогаем
