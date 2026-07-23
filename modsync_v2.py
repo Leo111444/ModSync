@@ -206,7 +206,38 @@ class BuildManager:
         self.draft_dirty: bool = False
         self.publishing: bool = False
 
+        self._purge_trash()
         self._load_persisted()
+
+    # ---------- отложенное удаление ----------
+
+    def _move_to_trash(self, path: Path) -> None:
+        """Переименовать в .trash_* вместо удаления: rename работает даже
+        когда файлы внутри открыты, а настоящий rmtree делаем при старте."""
+        path = Path(path)
+        if not path.exists():
+            return
+        for attempt in range(5):
+            dst = self.builds_dir / f".trash_{int(time.time() * 1000)}_{attempt}"
+            try:
+                os.rename(path, dst)
+                return
+            except OSError:
+                time.sleep(0.2)
+        # rename не удался (занята сама директория) — оставляем как есть,
+        # подберём при следующем старте
+
+    def _purge_trash(self) -> None:
+        """Удалить накопившийся мусор (зовётся при старте, когда дескрипторы
+        свободны). Осиротевшие staging_* тоже считаются мусором."""
+        import shutil as _sh
+        try:
+            for entry in self.builds_dir.iterdir():
+                if entry.is_dir() and (entry.name.startswith(".trash_")
+                                       or entry.name.startswith("staging_")):
+                    _sh.rmtree(entry, ignore_errors=True)
+        except OSError:
+            pass
 
     # ---------- персистентность ----------
 
@@ -404,37 +435,45 @@ class BuildManager:
                 mtime=0,
             )
 
-            # staging → постоянное место builds/<build_id>
+            # staging → постоянное место builds/<build_id>.
+            # Ничего не удаляем на месте: занятые файлы (сид, редактор,
+            # антивирус) роняют rmtree и вызывают системные диалоги Windows.
+            # Вместо удаления — переименование в .trash_* (работает даже
+            # с открытыми файлами внутри), чистка мусора при старте.
             final_dir = self.builds_dir / build_id
             if final_dir.exists():
-                import shutil as _sh
-                _sh.rmtree(final_dir, ignore_errors=True)
-            if final_dir.exists():
-                # rmtree не удалось (сидер держит файлы) — проверяем infohash:
-                # если совпадает, содержимое идентично и можно переиспользовать.
-                # Если нет — коллизия build_id (32-бит), переименовываем старую папку.
-                import shutil as _sh
-                reuse = False
+                same = False
                 with self.lock:
-                    reuse = (self.infohash_v2 == infohash_v2)
-                if reuse:
-                    _sh.rmtree(staging, ignore_errors=True)
+                    same = (self.infohash_v2 == infohash_v2)
+                if same:
+                    # тот же состав уже опубликован — новый снапшот не нужен
+                    self._move_to_trash(staging)
                     staging = None
                 else:
-                    old_dir = final_dir.parent / (final_dir.name + "_old")
-                    if old_dir.exists():
-                        _sh.rmtree(old_dir, ignore_errors=True)
-                    try:
-                        os.rename(final_dir, old_dir)
-                        os.rename(staging, final_dir)
-                        staging = None
-                        _sh.rmtree(old_dir, ignore_errors=True)
-                    except OSError:
-                        _sh.rmtree(staging, ignore_errors=True)
-                        staging = None
-            else:
+                    # неизменный build_id при другом infohash — старую убираем
+                    self._move_to_trash(final_dir)
+            if staging is not None:
                 os.rename(staging, final_dir)
                 staging = None  # успешно переехал — в finally не трогаем
+
+            # ── верификация: снапшот обязан совпадать с манифестом ──
+            # ловит файлы, изменённые в момент снапшота, обрывы копирования,
+            # остатки старых сборок — всё, что даст клиентам битую раздачу
+            snap_mods_final = final_dir / "Mods"
+            for f in files_flat:
+                p = snap_mods_final / f["path"]
+                try:
+                    actual = p.stat().st_size
+                except OSError:
+                    self._move_to_trash(final_dir)
+                    raise RuntimeError(
+                        f"верификация снапшота: файл отсутствует — {f['path']}")
+                if actual != f["size"]:
+                    self._move_to_trash(final_dir)
+                    raise RuntimeError(
+                        f"верификация снапшота: размер не совпал — {f['path']} "
+                        f"(снапшот {actual}, манифест {f['size']}). "
+                        f"Вероятно, файл менялся во время публикации — повторите.")
 
             with self.lock:
                 self.build_id = build_id
@@ -447,11 +486,12 @@ class BuildManager:
                 self.draft_dirty = False
                 self._persist()
 
-            # чистим прочие снапшоты (hardlink — места не занимали, но порядок)
-            import shutil as _sh
+            # прочие снапшоты — в мусор (удалится при следующем старте,
+            # когда никто не держит файлы)
             for entry in self.builds_dir.iterdir():
-                if entry.is_dir() and entry.name != build_id:
-                    _sh.rmtree(entry, ignore_errors=True)
+                if (entry.is_dir() and entry.name != build_id
+                        and not entry.name.startswith(".trash_")):
+                    self._move_to_trash(entry)
 
             log(f"[V2] Опубликовано: build {build_id}, "
                 f"{len(files_flat)} файлов, infohash {infohash_v2[:16]}…")
@@ -462,8 +502,7 @@ class BuildManager:
                                for f in files_flat]}
         finally:
             if staging is not None and staging.exists():
-                import shutil as _sh
-                _sh.rmtree(staging, ignore_errors=True)
+                self._move_to_trash(staging)
             with self.lock:
                 self.publishing = False
 

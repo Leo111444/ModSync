@@ -1591,7 +1591,14 @@ TRANSLATIONS = {
         "btn_publish":          "Publish",
         "btn_publish_tip":      "Publish the current Mods snapshot as a new build for clients to download.",
         "btn_auto_publish":     "Auto-publish",
-        "tip_auto_publish":     "ON: changes in Mods folder are published automatically (5 sec delay).\nOFF: manual publish only.",
+        "tip_auto_publish":     (
+            "ON: changes in tracked mods are published automatically.\n"
+            "Adaptive delay: 5 sec of quiet after a normal edit; during mass\n"
+            "file copying (10+ changes/min) it waits 30 sec of quiet instead,\n"
+            "so a half-copied mod never gets published. If files keep changing\n"
+            "for over 10 minutes, the build is published anyway.\n"
+            "OFF: manual publish only."
+        ),
         "lbl_build":            "Build:",
         "lbl_listing":          "Public listing",
         "tip_listing":          "Register this server on the master server (bar7dtd.ru) so clients can find it automatically.\nIn Whitelist mode the server is visible but mod exchange works only with your authorised players.",
@@ -1699,12 +1706,20 @@ TRANSLATIONS = {
         "lbl_restart_watch":    "Track server restart",
         "tip_restart_watch":    (
             "Watch 7DaysToDieServer.exe PID every 30 sec.\n"
-            "When PID changes (server restarted) — republish the build after 10 sec\n"
+            "When PID changes (server restarted) — republish the build after the delay\n"
             "so players always get up-to-date mods before joining."
         ),
         "log_rw_on":            "[APP] Server restart tracking enabled",
         "log_rw_off":           "[APP] Server restart tracking disabled",
-        "log_rw_restarted":     "[APP] Server restarted (new PID: {pid}) — republishing in 10 sec…",
+        "log_rw_restarted":     "[APP] Server restarted (new PID: {pid}) — republishing in {delay} sec…",
+        "lbl_restart_delay":    "delay, sec:",
+        "tip_restart_delay":    (
+            "Wait this long after a game-server restart before republishing.\n"
+            "Mods write their configs during startup — publishing too early\n"
+            "captures half-written files. Heavy mod packs may need 120–300 sec."
+        ),
+        "log_mass_start":       "[V2] Mass file changes detected ({n}/min) — waiting for the copy to finish (30 sec of quiet)",
+        "log_pub_forced":       "[V2] Files kept changing for 10+ min — publishing anyway",
         "log_rw_republish":     "[APP] Auto-republish triggered after server restart",
         "dlg_close_title":      "Stop server?",
         "dlg_close_text":       "The HTTP server is currently running. Clients will not be able to sync.\n\nStop the server and close the application?",
@@ -1761,7 +1776,14 @@ TRANSLATIONS = {
         "btn_publish":          "Публикация",
         "btn_publish_tip":      "Опубликовать текущий снапшот модов как новую сборку для скачивания клиентами.",
         "btn_auto_publish":     "Автопубликация",
-        "tip_auto_publish":     "ВКЛ: изменения в папке модов публикуются автоматически через 5 сек.\nВЫКЛ: публикация только вручную.",
+        "tip_auto_publish":     (
+            "ВКЛ: изменения в отслеживаемых модах публикуются автоматически.\n"
+            "Адаптивная задержка: 5 сек тишины после обычной правки; при массовом\n"
+            "копировании (10+ изменений/мин) — 30 сек тишины, чтобы не опубликовать\n"
+            "полускопированный мод. Если файлы меняются дольше 10 минут подряд —\n"
+            "сборка публикуется принудительно.\n"
+            "ВЫКЛ: публикация только вручную."
+        ),
         "lbl_build":            "Сборка:",
         "lbl_listing":          "Публичный листинг",
         "tip_listing":          "Зарегистрировать сервер на мастер-сервере (bar7dtd.ru), чтобы клиенты могли найти его автоматически.\nВ режиме Вайтлист сервер виден в списке, но обмен модами работает только с авторизованными игроками.",
@@ -1864,12 +1886,20 @@ TRANSLATIONS = {
         "lbl_restart_watch":    "Отслеживать рестарт",
         "tip_restart_watch":    (
             "Следить за PID процесса 7DaysToDieServer.exe каждые 30 сек.\n"
-            "При смене PID (рестарт сервера) — публикуем новый билд через 10 сек,\n"
+            "При смене PID (рестарт сервера) — публикуем новый билд после задержки,\n"
             "чтобы игроки получили актуальные моды перед входом."
         ),
         "log_rw_on":            "[APP] Отслеживание рестарта сервера включено",
         "log_rw_off":           "[APP] Отслеживание рестарта сервера выключено",
-        "log_rw_restarted":     "[APP] Сервер перезапущен (новый PID: {pid}) — публикация через 10 сек…",
+        "log_rw_restarted":     "[APP] Сервер перезапущен (новый PID: {pid}) — публикация через {delay} сек…",
+        "lbl_restart_delay":    "задержка, сек:",
+        "tip_restart_delay":    (
+            "Сколько ждать после рестарта игрового сервера перед публикацией.\n"
+            "Моды пишут свои конфиги при запуске — ранняя публикация захватит\n"
+            "недописанные файлы. Тяжёлым сборкам может понадобиться 120–300 сек."
+        ),
+        "log_mass_start":       "[V2] Массовое изменение файлов ({n}/мин) — жду окончания копирования (30 сек тишины)",
+        "log_pub_forced":       "[V2] Файлы меняются непрерывно 10+ мин — публикую принудительно",
         "log_rw_republish":     "[APP] Автоматическая публикация после рестарта сервера",
         "dlg_close_title":      "Остановить сервер?",
         "dlg_close_text":       "HTTP-сервер сейчас работает. Клиенты не смогут синхронизироваться.\n\nОстановить сервер и закрыть приложение?",
@@ -1977,7 +2007,13 @@ class ServerWindow(QWidget):
 
         self._auto_pub_timer = QTimer(self)
         self._auto_pub_timer.setSingleShot(True)
-        self._auto_pub_timer.timeout.connect(self.trigger_publish)
+        self._auto_pub_timer.timeout.connect(self._on_auto_pub_fire)
+
+        # адаптивный дебаунс: история событий, отметка первого изменения,
+        # флаг массового режима
+        self._fs_events: list[float] = []
+        self._pending_since: float | None = None
+        self._mass_mode: bool = False
 
         # ─── BLOCK 1: Mods folder (full width) ───
         card1, c1, _ = _make_card()
@@ -2185,6 +2221,16 @@ class ServerWindow(QWidget):
         self.restart_watch_chk.setToolTip(self.tr("tip_restart_watch"))
         self.restart_watch_chk.toggled.connect(self._on_restart_watch_toggled)
         r_rw.addWidget(self.restart_watch_chk)
+
+        self.lbl_restart_delay_w = QLabel(self.tr("lbl_restart_delay"))
+        self.lbl_restart_delay_w.setStyleSheet("color: #5a6070; font-size: 12px;")
+        r_rw.addWidget(self.lbl_restart_delay_w)
+        self.restart_delay_edit = QLineEdit(str(cfg.get("restart_publish_delay", 60)))
+        self.restart_delay_edit.setFixedWidth(48)
+        self.restart_delay_edit.setToolTip(self.tr("tip_restart_delay"))
+        self.restart_delay_edit.editingFinished.connect(self.save_config)
+        r_rw.addWidget(self.restart_delay_edit)
+
         r_rw.addStretch(1)
         c3.addLayout(r_rw)
 
@@ -2572,31 +2618,94 @@ class ServerWindow(QWidget):
         paths_to_watch = []
 
         if mods_root.exists() and mods_root.is_dir():
+            # корень — чтобы видеть добавление/удаление модов
             paths_to_watch.append(str(mods_root))
             try:
                 tracked = set(self.state.tracked_mods)
                 for entry in mods_root.iterdir():
-                    if entry.is_dir() and entry.name in tracked:
-                        paths_to_watch.append(str(entry))
+                    if not entry.is_dir() or entry.name not in tracked:
+                        continue
+                    # РЕКУРСИВНО: правка в mod/Config/x.csv иначе не ловится —
+                    # QFileSystemWatcher следит только за перечисленными путями
+                    paths_to_watch.append(str(entry))
+                    for dirpath, dirnames, _f in os.walk(entry):
+                        dirnames[:] = [d for d in dirnames
+                                       if d.lower() != "disabled_mods"]
+                        for d in dirnames:
+                            paths_to_watch.append(str(Path(dirpath) / d))
             except Exception:
                 pass
 
         if paths_to_watch:
+            # лимит Windows на количество наблюдаемых путей — предупредим
+            if len(paths_to_watch) > 2000:
+                self.append_log(f"[WATCH] ВНИМАНИЕ: {len(paths_to_watch)} путей — "
+                                f"возможен пропуск событий, рассмотрите watchdog")
             self.fs_watcher.addPaths(paths_to_watch)
             self.append_log(f"[WATCH] Watching {len(paths_to_watch)} folders")
 
-    def on_fs_changed(self, _path: str):
+    def on_fs_changed(self, changed_path: str):
         self.rescan_debounce.start(1500)
-        if self.state.v2 is not None:
-            self.state.v2.build.mark_dirty()
-            if self.auto_publish_chk.isChecked():
-                self._auto_pub_timer.start(5000)
-            else:
-                self.refresh_v2_status()
+        if self.state.v2 is None:
+            return
+
+        # событие вне отслеживаемых модов (и не корень Mods) — игнор для draft
+        try:
+            mods_root = Path(self.mods_edit.text().strip() or DEFAULT_MODS_PATH)
+            p = Path(changed_path)
+            if p != mods_root:
+                rel = p.relative_to(mods_root)
+                top = rel.parts[0] if rel.parts else ""
+                if top and top not in self.state.tracked_mods:
+                    return
+        except (ValueError, OSError):
+            return
+
+        self.state.v2.build.mark_dirty()
+        if not self.auto_publish_chk.isChecked():
+            self.refresh_v2_status()
+            return
+
+        # ── адаптивный дебаунс автопубликации ──
+        # обычная правка: 5 сек тишины; массовое копирование (>10 событий
+        # за минуту): 30 сек тишины; потолок: если draft висит >10 минут
+        # из-за непрерывной активности — публикуем принудительно
+        now = time.time()
+        self._fs_events.append(now)
+        self._fs_events = [t for t in self._fs_events if now - t < 60]
+        if self._pending_since is None:
+            self._pending_since = now
+
+        mass = len(self._fs_events) > 10
+        if mass and not self._mass_mode:
+            self._mass_mode = True
+            self.append_log(self.tr("log_mass_start", n=len(self._fs_events)))
+        elif not mass and self._mass_mode:
+            self._mass_mode = False
+
+        if now - self._pending_since > 600:
+            self.append_log(self.tr("log_pub_forced"))
+            self._pending_since = None
+            self._mass_mode = False
+            self._fs_events = []
+            self._auto_pub_timer.stop()
+            self.trigger_publish()
+            return
+
+        quiet_ms = 30_000 if mass else 5_000
+        self._auto_pub_timer.start(quiet_ms)
+        self.refresh_v2_status()
 
     # ---------------- scan async ----------------
 
     # ---------------- V2: публикация ----------------
+
+    def _on_auto_pub_fire(self):
+        """Автопубликация по тишине: сбрасываем состояние дебаунса."""
+        self._pending_since = None
+        self._mass_mode = False
+        self._fs_events = []
+        self.trigger_publish()
 
     def trigger_publish(self):
         """Публикация в рабочем потоке (кнопка / POST /api/v2/publish / автомат)."""
@@ -3875,6 +3984,7 @@ The list refreshes automatically every N hours (configurable).</p>
             "show_tooltips": getattr(self, "_show_tooltips", True),
             "server_name": self.server_name_edit.text().strip(),
             "restart_watch": self.restart_watch_chk.isChecked(),
+            "restart_publish_delay": self._get_restart_delay(),
         }
         write_config(cfg)
 
@@ -3927,8 +4037,17 @@ The list refreshes automatically every N hours (configurable).</p>
             return
         if new_pid != old_pid:
             self._restart_watch_pid = new_pid
-            self.log_bridge.log_signal.emit(self.tr("log_rw_restarted", pid=new_pid))
-            QTimer.singleShot(10_000, self._on_restart_republish)
+            delay_s = self._get_restart_delay()
+            self.log_bridge.log_signal.emit(
+                self.tr("log_rw_restarted", pid=new_pid, delay=delay_s))
+            QTimer.singleShot(delay_s * 1000, self._on_restart_republish)
+
+    def _get_restart_delay(self) -> int:
+        try:
+            v = int(self.restart_delay_edit.text().strip())
+            return max(10, min(v, 900))
+        except (ValueError, AttributeError):
+            return 60
 
     def _on_restart_republish(self):
         self.append_log(self.tr("log_rw_republish"))

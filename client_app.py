@@ -512,6 +512,10 @@ TRANSLATIONS = {
         "btn_show_rules":           "Show rules",
         "btn_reset_rules":          "Reset rules",
         "btn_check":                "Check updates",
+        "btn_cancel":               "✕ Cancel",
+        "st_cancelled":             "download cancelled",
+        "toast_build_changed":      "Server published a new build — restarting the download on it",
+        "tip_cancel":               "Stop the current download. Already-downloaded files stay on disk\nand will be reused on the next update (hash recheck).",
         "btn_download":             "Update mods",
         "btn_apply":                "Apply update",
         "btn_fix":                  "Fix extras (move to disabled)",
@@ -697,6 +701,10 @@ TRANSLATIONS = {
         "btn_show_rules":           "Правила",
         "btn_reset_rules":          "Сбросить правила",
         "btn_check":                "Проверить обновления",
+        "btn_cancel":               "✕ Отмена",
+        "st_cancelled":             "загрузка отменена",
+        "toast_build_changed":      "Сервер опубликовал новую сборку — перезапускаю загрузку на неё",
+        "tip_cancel":               "Остановить текущую загрузку. Уже скачанные файлы останутся на диске\nи будут переиспользованы при следующем обновлении (сверка по хешам).",
         "btn_download":             "Обновить моды",
         "btn_apply":                "Применить обновление",
         "btn_fix":                  "Убрать лишние моды",
@@ -1045,6 +1053,7 @@ class UiBridge(QObject):
 
     start_check = pyqtSignal(str)  # context: "manual"/"auto"
     seed_ready = pyqtSignal(bytes, str, str)  # torrent_bytes, base_url, mods_dir
+    build_changed = pyqtSignal(dict)  # новая сборка появилась во время загрузки
 @dataclass
 class DiffResult:
     server_manifest_hash: str
@@ -1226,6 +1235,7 @@ class ClientWindow(QWidget):
         self.bridge.steamid_ready.connect(self.on_steamid_ready)
         self.bridge.download_progress.connect(self.on_download_progress)
         self.bridge.seed_ready.connect(self._on_seed_ready)
+        self.bridge.build_changed.connect(self.on_build_changed_midflight)
 
         self._ping_last = 0.0  # 1s debounce for ping
         self._ms_servers_signal.connect(self._populate_server_combo)
@@ -1432,6 +1442,10 @@ class ClientWindow(QWidget):
         self.download_btn.clicked.connect(self.on_download_bundle)
         self.download_btn.setEnabled(False)
         rd.addWidget(self.download_btn)
+        self.cancel_btn = QPushButton()
+        self.cancel_btn.clicked.connect(self.on_cancel_update)
+        self.cancel_btn.setVisible(False)
+        rd.addWidget(self.cancel_btn)
         self.fix_btn = QPushButton(); self.fix_btn.setObjectName("fix_btn")
         self.fix_btn.clicked.connect(self.on_fix_extras)
         self.fix_btn.setEnabled(False)
@@ -1695,6 +1709,8 @@ class ClientWindow(QWidget):
         self.reset_rules_btn.setText(t("btn_reset_rules"))
         self.check_btn.setText(t("btn_check"))
         self.download_btn.setText(t("btn_download"))
+        self.cancel_btn.setText(t("btn_cancel"))
+        self.cancel_btn.setToolTip(t("tip_cancel"))
         self.fix_btn.setText(t("btn_fix"))
         self.open_temp_btn.setText(t("btn_appdata"))
         self.lang_btn.setText(t("btn_lang"))
@@ -2605,6 +2621,56 @@ class ClientWindow(QWidget):
             self._v2_poll_timer.start()
 
 
+    def on_cancel_update(self):
+        """П5: отмена активной загрузки по кнопке."""
+        if not self.v2_updating:
+            return
+        self.v2_updating = False
+        if self.v2_engine is not None:
+            try:
+                self.v2_engine.stop()
+            except Exception:
+                pass
+        self.cancel_btn.setVisible(False)
+        self.bridge.set_busy.emit(False)
+        self.bridge.status.emit(self.tr("st_cancelled"))
+        self.append_log("[V2] Загрузка отменена пользователем")
+        self.update_action_buttons()
+
+    def on_build_changed_midflight(self, new_build: dict):
+        """П4: сервер опубликовал новую сборку во время нашей загрузки.
+        Старый рой умер (сид ушёл на новый infohash) — останавливаемся
+        и перезапускаем обновление на актуальный торрент."""
+        if not self.v2_updating:
+            return
+        self.bridge.toast.emit(self.tr("toast_title"),
+                               self.tr("toast_build_changed"))
+        # останавливаем текущую загрузку
+        if self.v2_engine is not None:
+            try:
+                self.v2_engine.stop()
+            except Exception:
+                pass
+        self.v2_updating = False
+        # свежие build/manifest и перезапуск той же кнопкой
+        base = self._resolve_base(self.cfg.get("server_url", "").strip()).rstrip("/")
+
+        def refetch():
+            try:
+                b = new_build or modsync_v2.fetch_json(base + "/api/v2/build")
+                m = json.loads(modsync_v2.fetch_bytes(
+                    base + "/api/v2/manifest").decode("utf-8"))
+                self.v2_build = b
+                self.v2_manifest = m
+            except Exception as e:
+                self.bridge.error.emit(f"Не удалось получить новую сборку: {e}")
+                self.bridge.set_busy.emit(False)
+                return
+            # перезапуск в GUI-потоке
+            QTimer.singleShot(0, self.on_download_bundle)
+
+        threading.Thread(target=refetch, daemon=True).start()
+
     def on_download_bundle(self):
         """V2: обновление одним действием — recheck по хешам + докачка дельты
         прямо в папку Mods. Требует закрытую игру (файлы меняются на месте)."""
@@ -2635,6 +2701,10 @@ class ClientWindow(QWidget):
                 return
 
         self.v2_updating = True
+        self._v2_build_poll_counter = 0
+        self._v2_build_check_inflight = False
+        self.cancel_btn.setVisible(True)
+        self.cancel_btn.setEnabled(True)
         self.update_action_buttons()
         engine = self.v2_engine
 
@@ -2651,6 +2721,7 @@ class ClientWindow(QWidget):
                 # дальше — _v2_poll_timer в GUI-потоке
             except Exception as e:
                 self.v2_updating = False
+                QTimer.singleShot(0, lambda: self.cancel_btn.setVisible(False))
                 self.bridge.error.emit(str(e))
                 self.bridge.set_busy.emit(False)
                 return
@@ -2688,6 +2759,33 @@ class ClientWindow(QWidget):
         if self.v2_updating:
             state = p["state"]
             peers_dl = p["peers"]
+
+            # ── сервер мог опубликовать новую сборку прямо во время загрузки:
+            # раз в ~20 сек сверяем build_id; сменился — перезапускаем на новый
+            self._v2_build_poll_counter += 1
+            if (self._v2_build_poll_counter >= 20
+                    and not self._v2_build_check_inflight):
+                self._v2_build_poll_counter = 0
+                self._v2_build_check_inflight = True
+                base = self._resolve_base(
+                    self.cfg.get("server_url", "").strip()).rstrip("/")
+                cur_id = (self.v2_build or {}).get("build_id", "")
+
+                def _check_build():
+                    try:
+                        b = modsync_v2.fetch_json(base + "/api/v2/build", timeout=6)
+                        new_id = b.get("build_id", "")
+                        if new_id and cur_id and new_id != cur_id:
+                            self.bridge.log.emit(
+                                f"[V2] Сборка изменилась во время загрузки: "
+                                f"{cur_id} → {new_id}, перезапускаю на новую")
+                            self.bridge.build_changed.emit(b)
+                    except Exception:
+                        pass
+                    finally:
+                        self._v2_build_check_inflight = False
+
+                threading.Thread(target=_check_build, daemon=True).start()
             # log state transitions
             if state != self._v2_last_state:
                 self._v2_last_state = state
@@ -2746,6 +2844,7 @@ class ClientWindow(QWidget):
 
     def _v2_on_done(self):
         self.v2_updating = False
+        self.cancel_btn.setVisible(False)
         mods_dir = Path(self.cfg.get("mods_dir", "").strip())
         manifest = self.v2_manifest or {}
         build = self.v2_build or {}
